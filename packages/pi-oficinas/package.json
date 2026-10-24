@@ -18,7 +18,7 @@
   "description": "Turn one overloaded Pi session into a persistent team with separate working memory, identities and inboxes",
   "repository": {
     "type": "git",
-    "url": "https://github.com/otixe/pi-oficinas.git",
+    "url": "git+https://github.com/otixe/pi-oficinas.git",
     "directory": "packages/pi-oficinas"
   },
   "files": [
@@ -50,5 +50,10 @@
   },
   "bin": {
     "oficina": "bin/oficina"
-  }
+  },
+  "homepage": "https://github.com/otixe/pi-oficinas/tree/main/packages/pi-oficinas#readme",
+  "bugs": {
+    "url": "https://github.com/otixe/pi-oficinas/issues"
+  },
+  "author": "Otixe"
 }

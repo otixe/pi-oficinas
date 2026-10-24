@@ -18,7 +18,7 @@
   "description": "Make plan-first requests stick with acknowledged plans and a traceable human approval workflow",
   "repository": {
     "type": "git",
-    "url": "https://github.com/otixe/pi-oficinas.git",
+    "url": "git+https://github.com/otixe/pi-oficinas.git",
     "directory": "packages/pi-plan-gate"
   },
   "files": [
@@ -46,5 +46,10 @@
     "skills": [],
     "prompts": [],
     "themes": []
-  }
+  },
+  "homepage": "https://github.com/otixe/pi-oficinas/tree/main/packages/pi-plan-gate#readme",
+  "bugs": {
+    "url": "https://github.com/otixe/pi-oficinas/issues"
+  },
+  "author": "Otixe"
 }

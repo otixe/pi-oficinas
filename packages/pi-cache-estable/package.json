@@ -17,7 +17,7 @@
   "description": "Keep tool order steady and request longer retention so avoidable schema churn stops breaking the prompt-cache prefix",
   "repository": {
     "type": "git",
-    "url": "https://github.com/otixe/pi-oficinas.git",
+    "url": "git+https://github.com/otixe/pi-oficinas.git",
     "directory": "packages/pi-cache-estable"
   },
   "files": [
@@ -47,5 +47,10 @@
     "skills": [],
     "prompts": [],
     "themes": []
-  }
+  },
+  "homepage": "https://github.com/otixe/pi-oficinas/tree/main/packages/pi-cache-estable#readme",
+  "bugs": {
+    "url": "https://github.com/otixe/pi-oficinas/issues"
+  },
+  "author": "Otixe"
 }

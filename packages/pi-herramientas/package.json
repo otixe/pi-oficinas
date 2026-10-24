@@ -17,7 +17,7 @@
   "description": "Replace a wall of tool schemas with a compact catalog and activate registered capabilities when the task needs them",
   "repository": {
     "type": "git",
-    "url": "https://github.com/otixe/pi-oficinas.git",
+    "url": "git+https://github.com/otixe/pi-oficinas.git",
     "directory": "packages/pi-herramientas"
   },
   "files": [
@@ -45,5 +45,10 @@
     "skills": [],
     "prompts": [],
     "themes": []
-  }
+  },
+  "homepage": "https://github.com/otixe/pi-oficinas/tree/main/packages/pi-herramientas#readme",
+  "bugs": {
+    "url": "https://github.com/otixe/pi-oficinas/issues"
+  },
+  "author": "Otixe"
 }
