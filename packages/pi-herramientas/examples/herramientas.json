@@ -1,0 +1,15 @@
+{
+  "base": [
+    "read",
+    "bash"
+  ],
+  "grupos": {
+    "editing": {
+      "linea": "Enable editing tools",
+      "tools": [
+        "edit",
+        "write"
+      ]
+    }
+  }
+}

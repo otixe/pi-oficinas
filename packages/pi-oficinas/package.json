@@ -1,0 +1,54 @@
+{
+  "name": "@otixe/pi-oficinas",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "ai-agents",
+    "multi-agent",
+    "agent-team",
+    "session-management",
+    "claude",
+    "codex",
+    "llm",
+    "coding-agent",
+    "agent-orchestration"
+  ],
+  "description": "Turn one overloaded Pi session into a persistent team with separate working memory, identities and inboxes",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/otixe/pi-oficinas.git",
+    "directory": "packages/pi-oficinas"
+  },
+  "files": [
+    "extensions",
+    "lib",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "examples",
+    "bin",
+    "README.es.md",
+    "media"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "image": "https://raw.githubusercontent.com/otixe/pi-oficinas/main/packages/pi-oficinas/media/preview.png",
+    "extensions": [
+      "./extensions/secretaria.ts"
+    ],
+    "skills": [],
+    "prompts": [],
+    "themes": []
+  },
+  "bin": {
+    "oficina": "bin/oficina"
+  }
+}

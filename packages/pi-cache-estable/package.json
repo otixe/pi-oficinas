@@ -1,0 +1,51 @@
+{
+  "name": "@otixe/pi-cache-estable",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "ai-agents",
+    "prompt-cache",
+    "cache-retention",
+    "tool-order",
+    "claude",
+    "codex",
+    "llm",
+    "coding-agent"
+  ],
+  "description": "Keep tool order steady and request longer retention so avoidable schema churn stops breaking the prompt-cache prefix",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/otixe/pi-oficinas.git",
+    "directory": "packages/pi-cache-estable"
+  },
+  "files": [
+    "extensions",
+    "lib",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "examples",
+    "README.es.md",
+    "media"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "image": "https://raw.githubusercontent.com/otixe/pi-oficinas/main/packages/pi-cache-estable/media/preview.png",
+    "extensions": [
+      "./extensions/aa-cache-retention-1h.ts",
+      "./extensions/aa-tools-order.ts",
+      "./extensions/tools-runtime-coherence.ts"
+    ],
+    "skills": [],
+    "prompts": [],
+    "themes": []
+  }
+}

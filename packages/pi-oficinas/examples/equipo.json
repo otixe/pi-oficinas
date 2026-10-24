@@ -1,0 +1,29 @@
+{
+  "version": 2,
+  "lider": "coordinator",
+  "lider_key_env": "TEAM_COORDINATOR_KEY",
+  "office_key_prefix": "TEAM_OFFICE_KEY_",
+  "base": "/absolute/path/to/team",
+  "lider_body": "/absolute/path/to/team/coordinator",
+  "soul_prefix": "50 Agents/Example/Equipo",
+  "oficinas": ["worker"],
+  "distribucion": "distribucion.json",
+  "secretaria": {
+    "monitor": true,
+    "avisos": true,
+    "contexto": true,
+    "correo": true,
+    "correo_respaldo": true,
+    "quiet_min": 30,
+    "parada_min": 10,
+    "pegada_min": 20,
+    "reentrada_cooldown_min": 60,
+    "contexto_aviso": 60,
+    "contexto_ttl_min": 5,
+    "gracia_min": 5,
+    "correo_cada_min": 2,
+    "correo_tope_diario": 20,
+    "correo_tope_hora": 5,
+    "confirmacion_min": 15
+  }
+}

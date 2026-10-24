@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "priority": [
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "plan_*"
+  ],
+  "unlisted": "alphabetical"
+}

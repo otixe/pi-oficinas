@@ -1,0 +1,2539 @@
+#!/usr/bin/env python3
+"""Piloto de oficinas: crear, abrir con gate por efecto, estado, cerrar."""
+import argparse
+from datetime import datetime, timezone
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import uuid
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from oficina_layout import choose_split
+from oficina_ordenar import plan, expected_rects, validate_layout, leader_width
+from oficina_distribucion import read_distribution
+from equipo_config import DEFAULT_PATH, load_equipo, paths, soul_path as configured_soul_path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _startup_team():
+    # --equipo must be honored even if the implicit default file is absent.
+    if __name__ == '__main__' and '--equipo' in sys.argv:
+        index = sys.argv.index('--equipo') + 1
+        if index >= len(sys.argv):
+            raise ValueError('--equipo requiere ruta')
+        return load_equipo(sys.argv[index])
+    return load_equipo()
+
+
+TEAM = _startup_team()
+BASE, LEADER_BODY, REGISTRY, DISTRIBUTION = paths(TEAM)
+LEADER = TEAM['lider']
+AGENTS = frozenset(TEAM['oficinas'])
+ORDER = tuple(TEAM['oficinas'])
+KEY_PREFIX = TEAM['office_key_prefix']
+COMMON_TOOLS = frozenset(('cb_whoami', 'cb_vault_read', 'cb_task_get', 'cb_task_activity', 'cb_tasks_inbox',
+                          'cb_task_comment', 'cb_task_claim', 'cb_task_submit',
+                          'subagent', 'get_subagent_result', 'steer_subagent',
+                          'web_search', 'fetch_content', 'get_search_content', 'source_check',
+                          # F4 (a82e464f): meta-tool de herramientas a demanda. Sólo reactiva tools del
+                          # universo del cuerpo (⊆ este mismo --tools); no abre nada fuera de la ficha.
+                          'herramientas_activar',
+                          # SoL-Pi: Observation Pack reemplaza los resultados grandes por un placeholder que
+                          # sólo se recupera con obs_recall, y OCC lleva el plan con update_plan. Si una ficha
+                          # no las lista, --tools las deja afuera y la oficina pierde salidas en silencio
+                          # Preserve the runtime observation/plan tools listed in the configured profile.
+                          'obs_recall', 'update_plan'))
+# Registered in both leader and office bodies by secretaria.ts (vm_turno: líder y oficinas).
+# Leader-only tools must never leak through the process-level --tools allowlist.
+OFFICE_EXTENSION_TOOLS = frozenset(('oficina_preguntar', 'vm_turno'))
+BACKGROUND_TOOLS = frozenset(('bg_run', 'bg_status', 'bg_logs', 'bg_kill'))
+SHELL_AND_WRITES = frozenset(('bash', 'edit', 'write', 'bg_run'))
+
+
+def select_team(config):
+    """Bind one validated team before any command or filesystem mutation."""
+    global TEAM, BASE, LEADER_BODY, REGISTRY, DISTRIBUTION, LEADER, AGENTS, ORDER, KEY_PREFIX
+    TEAM = config
+    BASE, LEADER_BODY, REGISTRY, DISTRIBUTION = paths(config)
+    LEADER = config['lider']
+    AGENTS = frozenset(config['oficinas'])
+    ORDER = tuple(config['oficinas'])
+    KEY_PREFIX = config['office_key_prefix']
+
+
+def soul_path(agent):
+    return configured_soul_path(TEAM, agent)
+
+
+def parse_ficha(ficha, agent):
+    parts = ficha.split('---', 2)
+    if len(parts) < 3 or parts[0].strip():
+        raise ValueError(f'Frontmatter inválido: {agent}')
+    fields = {}
+    for line in parts[1].splitlines():
+        if ':' in line:
+            key, value = line.split(':', 1)
+            fields[key.strip()] = value.strip().strip('"')
+    for key in ('model', 'thinking', 'tools', 'description'):
+        if not fields.get(key):
+            raise ValueError(f'Ficha {agent} sin {key}')
+    raw_tools = [t.strip() for t in fields['tools'].split(',')]
+    if not all(re.fullmatch(r'[a-zA-Z_][a-zA-Z_0-9]*', t) for t in raw_tools):
+        raise ValueError(f'Ficha {agent} tools inválidas')
+    fields['tools'] = frozenset(raw_tools)
+    return parts[2].strip(), fields
+
+
+def agent_ficha(agent):
+    if agent not in AGENTS:
+        raise ValueError(f'Agente fuera de allowlist: {agent}')
+    path = LEADER_BODY / '.pi/agents' / f'{agent}.md'
+    if not path.is_file():
+        raise ValueError(f'Ficha inexistente: {agent}')
+    ficha = path.read_text()
+    prose, fields = parse_ficha(ficha, agent)
+    allowed = (fields['tools'] - BACKGROUND_TOOLS) | COMMON_TOOLS | OFFICE_EXTENSION_TOOLS
+    if 'bash' in fields['tools']:
+        allowed |= BACKGROUND_TOOLS
+    fields['allowed_tools'] = allowed
+    return ficha, prose, fields
+
+
+def verify_practitioner_fichas(body, agent, owner_tools):
+    folder = body / '.pi' / 'agents'
+    own = folder / f'{agent}.md'
+    if not own.is_file():
+        raise ValueError(f'Falta ficha de practicante {agent}')
+    for path in folder.glob('*.md'):
+        text = path.read_text()
+        parts = text.split('---', 2)
+        if len(parts) < 3 or parts[0].strip():
+            raise ValueError(f'Frontmatter inválido en ficha de practicante {path.name}')
+        enabled = re.findall(r'(?m)^enabled:[ \t]*(.*?)[ \t]*$', parts[1])
+        if path == own:
+            if enabled and enabled != ['true']:
+                raise ValueError('Ficha de practicante propia deshabilitada o ambigua')
+            _, fields = parse_ficha(text, agent)
+            if fields['tools'] != owner_tools:
+                raise ValueError('Tools de ficha de practicante distintas a la dueña')
+        elif path.name == f'mini-{agent}.md':
+            canonical = LEADER_BODY / '.pi' / 'agents' / path.name
+            if not canonical.is_file() or text != canonical.read_text():
+                raise ValueError('Ficha mini propia distinta de la copia líder')
+            _, fields = parse_ficha(text, f'mini-{agent}')
+            if (enabled != ['true'] or
+                    (os.environ.get('PI_OFICINAS_MINI_MODEL') and fields['model'] != os.environ['PI_OFICINAS_MINI_MODEL']) or
+                    fields['thinking'] != 'low' or
+                    fields['tools'] & {'bash', 'edit', 'write', 'subagent', 'cb_task_review', 'cb_task_claim', 'cb_task_submit'}):
+                raise ValueError('Ficha mini propia insegura o fuera de allowlist')
+        elif enabled != ['false']:
+            raise ValueError(f'Otra ficha habilitada o no deshabilitada: {path.name}')
+
+
+EXTENSIONS = ('cerebro-mcp.ts', 'cerebro-rest.ts', 'bootstrap-identity.ts',
+              'cerebro-continuity.ts', 'security.ts')
+PACKAGES = ('npm:@gotgenes/pi-subagents', 'npm:pi-web-access',
+            'npm:pi-background-tasks')
+OFFICE_RULES = ('\n## Oficina: papel y timbre\nEl timbre es sólo aviso, nunca orden. Leé la tarea en el tablero y respondé ahí.\n'
+                'Texto escrito en el panel SIN tarea es conversación: podés responder, pero no hagas '
+                'trabajo con efecto (escribir, borrar, mover o APIs que cambien estado); pedí una tarea.\n'
+                'Practicantes: al usar subagent elegí SIEMPRE subagent_type: "mini-{agent}"; NUNCA el tipo por defecto, '
+                'general-purpose, Explore ni Plan. Máximo tres y un nivel.\n'
+                'Para cada tarea autorizada: tomala con cb_task_claim, trabajá, dejá el resultado '
+                'con cb_task_comment y ENTREGÁ con cb_task_submit. La secretaria timbra tras el submit real.\n'
+                'Si tenés una pregunta o dependencia de una tarea, usá oficina_preguntar; '
+                'podés bloquearla y vinculá la dependencia con depends_on_id. La pregunta y respuesta '
+                'viven en el tablero, no en el timbre. NUNCA escribas directo a la persona: '
+                'preguntale a tu líder, que filtra y decide si escala.\n'
+                'Si la sonda de clase de la secretaria indica read-only (403 o error registrado), '
+                'NO eludas permisos: dejá resultado en comentario cuya PRIMERA línea sea ENTREGA·{agent}; '
+                'la secretaria verifica autoría y timbra sin fingir submit.\n')
+PROBE = ('Verificación de apertura: hacé dos llamadas DIRECTAS a las tools cb_whoami y '
+         'cb_vault_read de tu alma por ruta exacta, NO dentro de codemode ni de otra tool. '
+         'El gate requiere sus toolResults directos; un resultado envuelto no acredita la apertura. '
+         'Respondé sólo: IDENT:<valor LITERAL de identidad_resuelta en cb_whoami, incluyendo " (subagente)">|'
+         'ALMA:<agent del frontmatter>|TELEGRAM:<tools telegram_ o NINGUNA>. '
+         'NO acortes el valor de identidad_resuelta: debe decir exactamente "{agent} (subagente)".')
+# One CLI process owns its opening attempts. Never restore a receipt from history.
+OPENING_PROBES = {}
+
+
+def opening_probe_text(agent, nonce):
+    return (PROBE.format(agent=agent) + '\n'
+            'Esta apertura requiere resultados NUEVOS después de ESTE mensaje; '
+            'no reutilices evidencia de otra apertura.\nGATE_APERTURA_NONCE:' + nonce)
+
+
+def probe_message_text(message):
+    """SDK UserMessage supports a string or text/image blocks; no nested tool text."""
+    content = message.get('content')
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return '\n'.join(c['text'] for c in content if isinstance(c, dict)
+                         and c.get('type') == 'text' and isinstance(c.get('text'), str))
+    return ''
+
+
+def run(*args, cwd=None, timeout=330):
+    result = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    if result.returncode:
+        raise RuntimeError(f'{args[0]} {args[1:3]}: rc={result.returncode}; '
+                           f'{(result.stderr or result.stdout)[-600:]}')
+    return result.stdout.strip()
+
+
+def payload(text):
+    return json.loads(text)
+
+
+def registry_lock():
+    if BASE.is_symlink() or REGISTRY.is_symlink() or (BASE / 'registro.json.lock').is_symlink():
+        raise RuntimeError('Registro/base/lock con symlink; NO operar')
+    BASE.mkdir(parents=True, exist_ok=True)
+    lock = (BASE / 'registro.json.lock').open('a+')
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
+
+
+def load():
+    if REGISTRY.is_symlink():
+        raise RuntimeError('Registro con symlink; NO leer')
+    return json.loads(REGISTRY.read_text()) if REGISTRY.exists() else {}
+
+
+def save(records):
+    temp = BASE / f'.registro-{os.getpid()}.tmp'
+    temp.write_text(json.dumps(records, indent=2, ensure_ascii=False) + '\n')
+    temp.replace(REGISTRY)
+
+
+def create(agent):
+    raise RuntimeError('Crear cuerpos requiere generador de equipo por valor; NO crear ni copiar .env')
+
+
+def panes():
+    response = payload(run('herdr', 'pane', 'list'))
+    return response['result']['panes']
+
+
+def assert_no_orphaned_panes(records):
+    """One live observation per listed pane; never split over an unregistered body."""
+    listed = panes()
+    if not isinstance(listed, list):
+        raise RuntimeError('Censo de panes desconocido; NO abrir')
+    seen = set()
+    for row in listed:
+        pane_id = row.get('pane_id') if isinstance(row, dict) else None
+        if not isinstance(pane_id, str) or not pane_id or pane_id in seen:
+            raise RuntimeError('Censo de panes ambiguo; NO abrir')
+        seen.add(pane_id)
+        try:
+            info = live_pane(pane_id)
+        except Exception as exc:
+            raise RuntimeError(f'Pane {pane_id} no observado; NO abrir') from exc
+        if not isinstance(info, dict) or info.get('pane_id') != pane_id or not info.get('tab_id'):
+            raise RuntimeError(f'Pane {pane_id} ambiguo; NO abrir')
+        for name in ORDER:
+            registered = records.get(name)
+            if isinstance(registered, dict) and registered.get('pane_id') == pane_id:
+                continue
+            body = BASE / name
+            session = info.get('agent_session')
+            session = session if isinstance(session, dict) else {}
+            value = session.get('value')
+            pi_session = (info.get('agent') == 'pi' and session.get('agent') == 'pi'
+                          and session.get('kind') == 'path' and isinstance(value, str)
+                          and Path(value).is_absolute()
+                          and Path(value).is_relative_to(session_directory(body)))
+            if (info.get('cwd') == str(body) or info.get('foreground_cwd') == str(body)
+                    or pi_session):
+                raise RuntimeError(f"pane huérfano {pane_id} de {name} en {info['tab_id']}: recuperación supervisada")
+
+
+def pane_exists(pane_id):
+    return any(p.get('pane_id') == pane_id for p in panes())
+
+
+def live_pane(pane_id):
+    return payload(run('herdr', 'pane', 'get', pane_id))['result']['pane']
+
+
+def pane_confirmed_missing(pane_id):
+    """Only the structured not-found response for this ID authorizes archiving."""
+    if not isinstance(pane_id, str) or not pane_id.strip():
+        return False
+    try:
+        result = subprocess.run(('herdr', 'pane', 'get', pane_id), capture_output=True,
+                                text=True, timeout=10)
+        # herdr real imprime el error estructurado en stderr (medido 2026-09-28); los mocks, en stdout.
+        data = payload(result.stdout.strip() or result.stderr.strip())
+        return (result.returncode == 1 and isinstance(data, dict)
+                and isinstance(data.get('error'), dict)
+                and data['error'].get('code') == 'pane_not_found'
+                and 'result' not in data)
+    except Exception:
+        # Invalid output, timeout, transport errors and all other failures are unknown.
+        return False
+
+
+def session_root():
+    return Path.home() / '.pi' / 'agent' / 'sessions'
+
+
+def real_directory_chain(directory):
+    """Check every directory component by lstat, including home and /home."""
+    current = directory
+    while True:
+        mode = current.lstat().st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            return False
+        if current == current.parent:
+            return True
+        current = current.parent
+
+
+def ensure_session_root():
+    root = session_root()
+    try:
+        if real_directory_chain(root):
+            return
+    except (OSError, ValueError):
+        pass
+    raise RuntimeError(f'Raíz de sesiones o ancestro symlink/no directorio: {root}; NO operar')
+
+
+def session_directory(body):
+    """Where pi 1.0.4 actually writes this body's sessions.
+
+    Measured against pi 1.0.4 (dist/core/session-manager.js, dist/main.js): when
+    PI_CODING_AGENT_SESSION_DIR is exported, pi uses that path LITERALLY (no cwd bucket).
+    The '--encoded-cwd--' bucket under ~/.pi/agent/sessions only applies when pi falls
+    back to its own default (no PI_CODING_AGENT_SESSION_DIR set). coding_env_pairs()
+    exports PI_CODING_AGENT_SESSION_DIR=<body>/sessions exactly when equipo.json declares
+    pi_coding_session_dir; this must mirror the same condition or reanudar can't find
+    sessions saved under <body>/sessions (confirmed empty bucket vs populated <body>/sessions
+    absent in a team that declares it).
+    """
+    declared = TEAM if isinstance(TEAM, dict) else {}
+    if declared.get('pi_coding_session_dir', None) is not None:
+        return Path(body) / 'sessions'
+    bucket = '--' + str(body).strip('/').replace('/', '-') + '--'
+    return Path.home() / '.pi' / 'agent' / 'sessions' / bucket
+
+
+def valid_session_file(value, body):
+    """Require an actual regular file in this body's session bucket, never a symlink."""
+    if not isinstance(value, str) or not value:
+        return False
+    path = Path(value)
+    bucket = session_directory(body)
+    if not path.is_absolute() or not bucket.is_absolute() or path.parent != bucket:
+        return False
+    try:
+        if not real_directory_chain(bucket):
+            return False
+        if path.parent.resolve(strict=True) != bucket.resolve(strict=True):
+            return False
+        return stat.S_ISREG(path.lstat().st_mode)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+RUNTIME_POR_CUERPO = 'runtime-por-cuerpo.json'
+
+
+def runtime_por_cuerpo():
+    """b6a85259: <base>/runtime-por-cuerpo.json {agent: <base>/runtime[-x.y.z]/node_modules/.bin/pi}.
+    Outside equipo.json ON PURPOSE: equipo.json gates identity in every body (team-config.ts), so a
+    bad override here only fails launches closed, never identity. Absent file = {} (team pin)."""
+    path = BASE / RUNTIME_POR_CUERPO
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {}
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022):
+        raise RuntimeError(f'{RUNTIME_POR_CUERPO} no regular, ajeno o escribible por otros; NO arrancar')
+    try:
+        per = json.loads(path.read_text(encoding='utf-8'))
+    except ValueError as exc:
+        raise RuntimeError(f'{RUNTIME_POR_CUERPO} inválido; NO arrancar') from exc
+    pattern = re.escape(str(BASE)) + r'/runtime(-[0-9]+\.[0-9]+\.[0-9]+)?/node_modules/\.bin/pi'
+    if (not isinstance(per, dict) or any(k not in {LEADER, *AGENTS} or not isinstance(v, str)
+                                         or not re.fullmatch(pattern, v) for k, v in per.items())):
+        raise RuntimeError(f'{RUNTIME_POR_CUERPO} inválido: cuerpos del equipo -> <base>/runtime[-x.y.z]/node_modules/.bin/pi; NO arrancar')
+    return per
+
+
+def pinned_pi_bin(agent=None):
+    """Team pi binary. b6a85259: runtime-por-cuerpo.json overrides the team pin for that body only
+    (phased runtime migrations); no entry = team pin, as before.
+    F1 (a82e464f): if equipo.json has no pi_bin, it is the team's LOCAL
+    runtime, <base>/runtime/node_modules/.bin/pi, and NEVER the global `pi` (another version
+    and another ~/.pi). If it is missing, None here (the env builders stay as master) and
+    resolved_pi_bin() fails closed before starting pi."""
+    pin = TEAM.get('pi_bin') if isinstance(TEAM, dict) else None
+    if agent is not None:
+        pin = runtime_por_cuerpo().get(agent, pin)
+    if pin:
+        if not isinstance(pin, str) or not Path(pin).is_absolute():
+            raise RuntimeError('pi_bin inválido; NO arrancar')
+        return pin
+    local = BASE / 'runtime' / 'node_modules' / '.bin' / 'pi'
+    return str(local) if local.exists() else None
+
+
+def resolved_pi_bin(agent=None):
+    """pi to start: the pin or the local runtime. Without either one, fail closed (never the global)."""
+    pin = pinned_pi_bin(agent)
+    if not pin:
+        raise RuntimeError(f'Sin pi del equipo: falta pi_bin y {BASE / "runtime/node_modules/.bin/pi"}; '
+                           'instalá el runtime local (npm ci en <base>/runtime). NUNCA se usa el pi global; NO arrancar')
+    if not os.access(pin, os.X_OK):
+        raise RuntimeError(f'pi del equipo no ejecutable: {pin}; NO arrancar')
+    return pin
+
+
+def verified_team_pi(agent=None):
+    """QA 4c38abfc: resolves AND executes the team's pi (pin or local runtime) before any effect
+    (/quit in relanzar, split in abrir). If it fails, nothing is touched: the live pi stays as it was.
+    Returns (pin, version)."""
+    pin = resolved_pi_bin(agent)
+    return pin, expected_pi_version(pin)
+
+
+def version_tuple(text):
+    m = re.match(r'(\d+)\.(\d+)\.(\d+)', str(text).strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def no_mcp_args(version):
+    """F1/P4 (a82e464f): since pi 1.0.4, --tools keeps the MCP tools unless an entry starts with
+    mcp__ (CHANGELOG 1.0.4). --no-mcp keeps the ficha gate closed. In <1.0.4 the flag does not
+    exist and it would break startup, so it only goes in when the version allows it."""
+    v = version_tuple(version)
+    return ['--no-mcp'] if v is not None and v >= (1, 0, 4) else []
+
+
+def coding_env_pairs(body):
+    """PI_CODING_* only when equipo.json declares the one allowed relative dir.
+
+    Absent keys mean pi keeps ~/.pi/agent. Never invent a different team's layout.
+    """
+    declared = TEAM if isinstance(TEAM, dict) else {}
+    pairs = []
+    agent_dir = declared.get('pi_coding_agent_dir', None)
+    session_dir = declared.get('pi_coding_session_dir', None)
+    if agent_dir is not None:
+        if agent_dir != '.pi-agent':
+            raise RuntimeError('pi_coding_agent_dir inválido; NO arrancar')
+        pairs.append(('PI_CODING_AGENT_DIR', str(Path(body) / '.pi-agent')))
+    if session_dir is not None:
+        if session_dir != 'sessions':
+            raise RuntimeError('pi_coding_session_dir inválido; NO arrancar')
+        pairs.append(('PI_CODING_AGENT_SESSION_DIR', str(Path(body) / 'sessions')))
+    return pairs
+
+
+def assert_declared_agent_dir(body):
+    """If the team declares an agent dir, it must already hold auth and settings.
+
+    This task never creates or seeds that directory. A missing piece fails closed
+    before a pane split or /quit.
+    """
+    declared = TEAM if isinstance(TEAM, dict) else {}
+    name = declared.get('pi_coding_agent_dir', None)
+    if name is None:
+        return None
+    if name != '.pi-agent':
+        raise RuntimeError('pi_coding_agent_dir inválido; NO arrancar')
+    agent_dir = Path(body) / '.pi-agent'
+    try:
+        info = agent_dir.lstat()
+    except OSError as exc:
+        raise RuntimeError('agent dir declarado ausente; NO arrancar') from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError('agent dir declarado no es directorio real; NO arrancar')
+    for filename in ('auth.json', 'settings.json'):
+        path = agent_dir / filename
+        try:
+            mode = path.lstat().st_mode
+        except OSError as exc:
+            raise RuntimeError(f'{filename} ausente en el agent dir; NO arrancar') from exc
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise RuntimeError(f'{filename} del agent dir no es archivo regular; NO arrancar')
+    return agent_dir
+
+
+def pane_identity_pairs(agent, body):
+    body = Path(body)
+    if agent not in AGENTS or body != BASE / agent:
+        raise ValueError('Export de shell fuera del cuerpo propio')
+    equipo = os.environ.get('PI_OFICINAS_EQUIPO')
+    if not isinstance(equipo, str) or not equipo or equipo.startswith('-'):
+        raise RuntimeError('PI_OFICINAS_EQUIPO no configurado; NO arrancar pi')
+    return [('PI_AGENT_NAME', agent), ('PI_OFICINAS_EQUIPO', equipo), *coding_env_pairs(body)]
+
+
+def pane_split_env(agent, body):
+    """--env flags for a new pane. Without coding keys this is master's pair."""
+    args = []
+    for key, value in pane_identity_pairs(agent, body):
+        args.extend(('--env', f'{key}={value}'))
+    pin = pinned_pi_bin(agent)
+    if pin:
+        args.extend(('--env', f'PI_OFI_PI_BIN={pin}'))
+        args.extend(('--env', f'PATH={Path(pin).parent}{os.pathsep}{os.environ.get("PATH", "")}'))
+    return args
+
+
+def fish_quote(value):
+    """fish single-quoted literal (inside '…' only \\ and \' are escapes)."""
+    return "'" + str(value).replace('\\', '\\\\').replace("'", "\\'") + "'"
+
+
+def shell_kind(name):
+    """fish or posix (bash/zsh/sh) for the pane shell. Anything else: fail closed."""
+    if name == 'fish':
+        return 'fish'
+    if name in ('bash', 'zsh', 'sh'):
+        return 'posix'
+    raise RuntimeError(f'shell del pane no reconocida ({name!r}); NO arrancar pi')
+
+
+def office_shell_exports(agent, body, shell='posix'):
+    """Exact export line for the pane shell. Names and paths only; never a secret.
+
+    Default is PI_AGENT_NAME and PI_OFICINAS_EQUIPO only. PI_CODING_* is added
+    only when the team declares pi_coding_agent_dir / pi_coding_session_dir.
+    With a pin, PI_OFI_PI_BIN is authoritative and PATH still puts its directory first.
+
+    ddab4e90: the syntax depends on the pane shell. In fish, $PATH is a LIST: `export
+    PATH=<dir>:$PATH` left «<dir>:<last element>» and node disappeared. In fish
+    it is `set -gx VAR value` and `set -gx PATH <dir> $PATH`; in POSIX, export, as before.
+    """
+    pairs = list(pane_identity_pairs(agent, body))
+    pin = pinned_pi_bin(agent)
+    if shell == 'fish':
+        commands = [f'set -gx {key} {fish_quote(value)}' for key, value in pairs]
+        if pin:
+            commands.append(f'set -gx PI_OFI_PI_BIN {fish_quote(pin)}')
+            commands.append(f'set -gx PATH {fish_quote(Path(pin).parent)} $PATH')
+        return '; '.join(commands)
+    if shell != 'posix':
+        raise RuntimeError(f'shell del pane no reconocida ({shell!r}); NO arrancar pi')
+    assignments = [f'{key}={shlex.quote(value)}' for key, value in pairs]
+    if pin:
+        assignments.append(f'PI_OFI_PI_BIN={shlex.quote(pin)}')
+        assignments.append(f'PATH={shlex.quote(str(Path(pin).parent))}:$PATH')
+    return 'export ' + ' '.join(assignments)
+
+
+def preflight_command(shell, pin, outfile):
+    """Pane check: pin declared, version of the pin by ABSOLUTE path (it does not depend on PATH
+    to find pi, but it does need node in PATH, through the shebang) and the `pi` that PATH
+    resolves (the one herdr agent start will use). Three lines; assert_pi_preflight requires them."""
+    if shell == 'fish':
+        return ('begin; test "$PI_OFI_PI_BIN" = ' + fish_quote(pin)
+                + '; and printf "%s\\n" "$PI_OFI_PI_BIN"; and "$PI_OFI_PI_BIN" --version; and command -v pi; end > '
+                + fish_quote(outfile))
+    return ('{ test "$PI_OFI_PI_BIN" = ' + shlex.quote(str(pin))
+            + ' && printf "%s\\n" "$PI_OFI_PI_BIN" && "$PI_OFI_PI_BIN" --version && command -v pi; } > '
+            + shlex.quote(str(outfile)))
+
+
+def assert_pi_preflight(text, pin, expected_version):
+    """The pane's declared pin, the pin's version and the pi that PATH resolves must match exactly."""
+    lines = text.splitlines()
+    if lines != [str(pin), str(expected_version), str(pin)]:
+        raise RuntimeError(f'pi del pane no es el pin ({lines!r}); NO arrancar')
+
+
+def expected_pi_version(pin):
+    result = subprocess.run([str(pin), '--version'], capture_output=True, text=True, timeout=30)
+    version = result.stdout.strip()
+    if result.returncode != 0 or not version or '\n' in version:
+        raise RuntimeError('pi pineado no ejecuta --version; NO arrancar')
+    return version
+
+
+def wait_for_preflight(path, attempts=40, delay=0.05, sleep=time.sleep):
+    last = ''
+    for attempt in range(attempts):
+        if path.is_symlink():
+            raise RuntimeError('preflight symlink; NO arrancar pi')
+        if path.is_file():
+            last = path.read_text()
+            if len(last.splitlines()) >= 3:
+                return last
+        if attempt + 1 < attempts:
+            sleep(delay)
+    raise RuntimeError(f'preflight del pane sin salida completa; NO arrancar pi ({last!r})')
+
+
+def pane_shell(pane):
+    """Shell of a pane WITHOUT pi: the single foreground process (fish/bash/zsh/sh)."""
+    info = payload(run('herdr', 'pane', 'process-info', '--pane', pane))['result']['process_info']
+    procs = [p for p in (info.get('foreground_processes') or []) if isinstance(p, dict)]
+    # Helpers can stay in the foreground (M2); the shell is the ONLY process with a shell name.
+    shells = [p for p in procs if p.get('name') in SHELLS]
+    if info.get('pane_id') != pane or len(shells) != 1 or any(p.get('name') == 'pi' for p in procs):
+        raise RuntimeError('shell del pane ambigua o ausente; NO arrancar pi')
+    return shell_kind(shells[0].get('name'))
+
+
+def shell_of_pid(pid):
+    """Shell that launched a pi process (its parent, from /proc): fish or posix."""
+    try:
+        stat_text = (PROC_ROOT / str(pid) / 'stat').read_text()
+        ppid = int(stat_text[stat_text.rindex(')') + 2:].split()[1])
+        name = (PROC_ROOT / str(ppid) / 'comm').read_text().strip()
+    except (OSError, ValueError, IndexError) as exc:
+        raise RuntimeError(f'no pude leer la shell del pi {pid}; NO relanzar') from exc
+    return shell_kind(name)
+
+
+def shell_binary(shell):
+    found = shutil.which('fish' if shell == 'fish' else 'bash') or (None if shell == 'fish' else shutil.which('sh'))
+    if not found:
+        raise RuntimeError(f'no hay {shell} local para verificar el preflight; NO relanzar')
+    return found
+
+
+def shell_argv(shell, line):
+    """Clean local shell for the dry-run (QA f9baa707): no config.fish, no profile/rc, no BASH_ENV/ENV."""
+    binary = shell_binary(shell)
+    if shell == 'fish':
+        return [binary, '--no-config', '-c', line]
+    name = Path(binary).name
+    if name == 'bash':
+        return [binary, '--noprofile', '--norc', '-c', line]
+    if name == 'zsh':
+        return [binary, '-f', '-c', line]
+    return [binary, '-c', line]
+
+
+PREFLIGHT_ENV_BASE = ('PATH', 'HOME', 'LANG')
+SECRET_NAME = re.compile(r'KEY|TOKEN|SECRET|PASS|AUTH|CRED|COOKIE', re.I)
+
+
+def preflight_env(env):
+    """QA f9baa707: the dry-run must NOT receive the full environ of the live pi (it carries
+    KIRO_API_KEY, the Cerebro keys, etc.). Only PATH, HOME, LANG and the PI_* of the office. A PI_*
+    whose name looks like a credential is left out too; today none does: PI_AGENT_NAME,
+    PI_OFICINAS_EQUIPO, PI_CODING_*, PI_OFI_PI_BIN."""
+    out = {k: env[k] for k in PREFLIGHT_ENV_BASE if isinstance(env.get(k), str)}
+    out.update({k: v for k, v in env.items()
+                if k.startswith('PI_') and isinstance(v, str) and not SECRET_NAME.search(k)})
+    return out
+
+
+def verify_preflight_before_quit(agent, body, pid):
+    """ddab4e90 (3): the WHOLE preflight can fail BEFORE /quit. It runs the exact line
+    prepare_pane_shell will send, in a real local shell of the same kind as the pane's (parent of
+    pi), with PATH/HOME/LANG/PI_* from the environment that pi inherited (/proc/<pid>/environ,
+    filtered: never keys) and without loading config (QA f9baa707). If it does not give the three
+    expected lines, abort without touching the live pi."""
+    pin = pinned_pi_bin(agent)
+    if not pin:
+        return None
+    shell = shell_of_pid(pid)
+    env = process_env(pid)
+    if not isinstance(env, dict) or not env.get('PATH'):
+        raise RuntimeError('entorno del pi del pane ilegible o sin PATH; NO relanzar')
+    expected = expected_pi_version(pin)
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='oficina-preflight-') as tmp:
+        outfile = Path(tmp) / 'preflight'
+        line = office_shell_exports(agent, body, shell) + '; ' + preflight_command(shell, pin, outfile)
+        subprocess.run(shell_argv(shell, line), env=preflight_env(env), capture_output=True, text=True, timeout=60)
+        text = outfile.read_text() if outfile.is_file() else ''
+    try:
+        assert_pi_preflight(text, pin, expected)
+    except RuntimeError as exc:
+        raise RuntimeError(f'preflight simulado en la shell del pane ({shell}) falló ANTES de /quit: {exc}') from exc
+    return shell
+
+
+def prepare_pane_shell(pane, agent, body, *, sleep=time.sleep):
+    """send-text the exact export, then fail closed unless the pane resolves the pin."""
+    body = Path(body)
+    assert_declared_agent_dir(body)
+    pin = pinned_pi_bin(agent)
+    outfile = None
+    expected = None
+    shell = pane_shell(pane)  # ddab4e90: syntax according to the shell (fish ≠ POSIX)
+    line = office_shell_exports(agent, body, shell)
+    if pin:
+        expected = expected_pi_version(pin)
+        state = body / 'state'
+        if state.is_symlink() or not state.is_dir():
+            raise RuntimeError('state del cuerpo ausente o symlink; NO arrancar pi')
+        outfile = state / f'pi-preflight-{time.time_ns()}'
+        if outfile.exists() or outfile.is_symlink():
+            raise RuntimeError('archivo de preflight ya existe; NO pisar')
+        line = line + '; ' + preflight_command(shell, pin, outfile)
+    run('herdr', 'pane', 'send-text', pane, line)
+    run('herdr', 'pane', 'send-keys', pane, 'Enter')
+    if outfile is None:
+        return line
+    text = wait_for_preflight(outfile, sleep=sleep)
+    trash = Path.home() / '.trash'
+    trash.mkdir(exist_ok=True)
+    dest = trash / f'pi-preflight-{agent}-{outfile.name}'
+    if dest.exists():
+        raise RuntimeError('destino de preflight ya existe; NO pisar')
+    outfile.rename(dest)
+    assert_pi_preflight(text, pin, expected)
+    return line
+
+
+# ---- bd6448fb: reanudar sesión previa (R1/R2/R3) ----
+POLL = float(os.environ.get('OFICINA_POLL', '0.25'))
+NEW_TIMEOUT = float(os.environ.get('OFICINA_NEW_TIMEOUT', '30'))
+# Decisión de the human 2026-10-05 (opción B): retomar SIN /new. El /new en proceso queda APAGADO
+# detrás de esta bandera: en pi-telegram 0.51.4, tras /new el registro de Thread queda con otro
+# slot que el binding y el reinicio siguiente no se reconecta (evidencia/bug-pi-telegram-slot.md).
+NEW_IN_PROCESS = os.environ.get('OFICINA_NEW_EN_PROCESO') == '1'
+TELEGRAM_WAIT = float(os.environ.get('OFICINA_TELEGRAM_WAIT', '45'))
+# a1d5394b (the human 2026-10-06): tras un reinicio completo pi-telegram 0.51.4 deja registros de thread
+# 'active' con pids muertos y rechaza el restore-only. Con =1 (opt-in, solo '1') la oficina se abre
+# igual SIN Telegram y lo avisa; nunca /telegram-connect ni /new, nunca toca state/journals/locks.
+TELEGRAM_OPTIONAL = os.environ.get('OFICINA_TELEGRAM_OPCIONAL') == '1'
+SHELLS = frozenset(('fish', 'bash', 'zsh', 'sh'))
+
+
+def session_header_id(value, body):
+    """Session id from the file's own header, only if it belongs to this body; else None."""
+    try:
+        with open(value) as fh:
+            head = json.loads(fh.readline())
+    except (OSError, ValueError, TypeError):
+        return None
+    sid = head.get('id') if isinstance(head, dict) else None
+    if (head.get('type') != 'session' or head.get('cwd') != str(body) or not isinstance(sid, str)
+            or not sid or not Path(value).name.endswith(f'_{sid}.jsonl')):
+        return None
+    return sid
+
+
+def session_id_from_path(value):
+    """Id embedded in pi's file name <ts>_<id>.jsonl (the new /new file may not exist yet)."""
+    name = Path(value).name if isinstance(value, str) else ''
+    match = re.fullmatch(r'[0-9TZ:.-]+_([0-9a-f-]{36})\.jsonl', name)
+    return match.group(1) if match else None
+
+
+def prior_session(agent, body, records):
+    """R1: the office's last registered gate session (live record, else latest archive).
+
+    Only an own, regular, header-consistent file in this body's bucket qualifies; an
+    absent, foreign or invalid one means: keep the current behaviour (fresh session).
+    """
+    item = records.get(agent)
+    value = None
+    if isinstance(item, dict):
+        value = item.get('session')
+    else:
+        for old in reversed(records.get('_historico') or []):
+            if isinstance(old, dict) and old.get('agente') == agent:
+                reg = old.get('registro')
+                value = reg.get('session') if isinstance(reg, dict) else None
+                break  # only the latest archive; never fall back to older sessions
+    if valid_session_file(value, body) and session_header_id(value, body):
+        return value
+    return None
+
+
+def pi_cli_args(fields, append_system, resume=None, agent=None):
+    """The pi arguments of the gate (same for herdr agent start and the e58b1319 shell start)."""
+    version = expected_pi_version(resolved_pi_bin(agent))
+    args = ['--approve']
+    if resume:
+        args += ['--session', resume]  # pi 1.0.0 docs/cli.md: --session <path|id>
+    return args + ['--model', fields['model'], '--thinking', fields['thinking'],
+                   '--tools', ','.join(sorted(fields['allowed_tools'])), *no_mcp_args(version),
+                   '--append-system-prompt', append_system]
+
+
+def pi_start(agent, pane, fields, append_system, resume=None):
+    # F1: always the team's pi (pin or local runtime), never the global one; --no-mcp if ≥1.0.4.
+    args = ['herdr', 'agent', 'start', agent, '--kind', 'pi', '--pane', pane,
+            '--timeout', '120000', '--', *pi_cli_args(fields, append_system, resume, agent)]
+    return run(*args, timeout=145)
+
+
+# ---- e58b1319: nombre de agente «fantasma» que herdr 0.9.0 conserva en el pane restaurado ----
+# Medido (evidencia/e58b1319): tras el restore, el pane queda en fish con agent=None pero herdr
+# mantiene el nombre (agent list: <nombre> status=unknown, mismo pane y terminal). `agent start`
+# devuelve agent_name_taken (y, con otro nombre, agent_pane_busy). NO lo liberan: release-agent
+# (CLI ni API), pane.clear_agent_authority ni agent rename --clear (agent_not_found). Lo que sí
+# funciona: arrancar pi por la shell de ESE pane; herdr lo detecta y el nombre pasa al pi vivo.
+NAME_TAKEN = re.compile(r'terminal_id=(\S+) pane_id=(\S+) workspace_id=\S+ tab_id=(\S+) cwd=(\S+) status=(\w+)')
+
+
+def ghost_name_in_pane(error_text, agent, pane, terminal, body):
+    """True only if herdr's agent_name_taken names EXACTLY this pane and terminal, status unknown,
+    and a fresh look confirms: the pane has no agent and agent list shows ONE ghost <agent> here.
+    The name held by any other pane, terminal or live status => False (fail closed)."""
+    text = str(error_text)
+    if 'agent_name_taken' not in text or f'agent name {agent} ' not in text:
+        return False
+    cands = NAME_TAKEN.findall(text)
+    if (len(cands) != 1 or cands[0][0] != terminal or cands[0][1] != pane
+            or cands[0][3] != str(body) or cands[0][4].lower() != 'unknown'):
+        return False
+    try:
+        info = live_pane(pane)
+        agents = payload(run('herdr', 'agent', 'list'))['result']['agents']
+    except Exception:
+        return False
+    mine = [a for a in agents if isinstance(a, dict) and a.get('name') == agent]
+    return (info.get('agent') in (None, '') and info.get('terminal_id') == terminal
+            and len(mine) == 1 and mine[0].get('pane_id') == pane
+            and mine[0].get('terminal_id') in (None, terminal)
+            and str(mine[0].get('agent_status') or '').lower() in ('unknown', ''))
+
+
+def pi_start_via_shell(agent, pane, fields, append_system, resume, terminal, body):
+    """e58b1319: same pi and arguments as pi_start, typed into the pane's own shell; then wait until
+    herdr detects pi in THAT pane with the agent's name and it is ready (idle/done)."""
+    pin = resolved_pi_bin(agent)
+    shell = pane_shell(pane)
+    argv = [pin, *pi_cli_args(fields, append_system, resume, agent)]
+    line = ' '.join(fish_quote(a) for a in argv) if shell == 'fish' else ' '.join(shlex.quote(a) for a in argv)
+    print(f'NOMBRE FANTASMA {agent}: herdr retiene el nombre en este mismo pane ({pane}, {terminal}); '
+          'arranco pi por la shell del pane (release-agent no lo libera)', flush=True)
+    run('herdr', 'pane', 'send-text', pane, line)
+    run('herdr', 'pane', 'send-keys', pane, 'Enter')
+
+    def detected():
+        try:
+            info = live_pane(pane)
+        except Exception:
+            return None
+        if info.get('terminal_id') != terminal:
+            raise RuntimeError(f'{agent}: el pane cambió de terminal mientras arrancaba pi; NO sigo')
+        return info if info.get('agent') == 'pi' else None
+    if wait_until(detected, 120) is None:
+        raise RuntimeError(f'{agent}: pi lanzado por la shell no fue detectado por herdr en {pane}')
+    run('herdr', 'agent', 'wait', pane, '--until', 'idle', '--until', 'done', '--timeout', '120000', timeout=130)
+    agents = payload(run('herdr', 'agent', 'list'))['result']['agents']
+    mine = [a for a in agents if isinstance(a, dict) and a.get('pane_id') == pane]
+    if len(mine) != 1 or mine[0].get('name') != agent:
+        raise RuntimeError(f'{agent}: tras el arranque por shell el pane no quedó con el nombre {agent} ({mine})')
+    if pane_pi_pid(pane, body) is None:
+        raise RuntimeError(f'{agent}: tras el arranque por shell no hay un pi único con cwd = cuerpo')
+
+
+def pi_start_same_pane(agent, pane, fields, append_system, resume, terminal, body):
+    """pi_start for a pane we must keep (relaunch in place). On agent_name_taken held by THIS same
+    pane/terminal (restore ghost), start through the shell once; any other cause propagates."""
+    try:
+        return pi_start(agent, pane, fields, append_system, resume)
+    except RuntimeError as exc:
+        if not ghost_name_in_pane(exc, agent, pane, terminal, body):
+            raise
+    return pi_start_via_shell(agent, pane, fields, append_system, resume, terminal, body)
+
+
+def pane_process(pane):
+    """Foreground process of the pane (one), from herdr process-info; None if ambiguous."""
+    info = payload(run('herdr', 'pane', 'process-info', '--pane', pane))['result']['process_info']
+    procs = info.get('foreground_processes') or []
+    if info.get('pane_id') != pane or len(procs) != 1 or not isinstance(procs[0].get('pid'), int):
+        return None
+    return procs[0]
+
+
+def pane_pi_pid(pane, body, agent=None, seen=None):
+    """pid of EXACTLY one foreground 'pi' in the pane with cwd = body, or None (one attempt).
+
+    Helper children may share the foreground group right after start (canary 2), so other
+    names are ignored, never a second 'pi'. With agent, its environ must be this office's.
+    """
+    try:
+        info = payload(run('herdr', 'pane', 'process-info', '--pane', pane))['result']['process_info']
+    except Exception:
+        return None
+    procs = info.get('foreground_processes') or []
+    if seen is not None:
+        seen[:] = [(p.get('name'), p.get('pid')) for p in procs if isinstance(p, dict)]
+    pis = [p for p in procs if isinstance(p, dict) and p.get('name') == 'pi'
+           and isinstance(p.get('pid'), int)]
+    if info.get('pane_id') != pane or len(pis) != 1 or pis[0].get('cwd') != str(body):
+        return None
+    if agent is not None and not office_env_ok(process_env(pis[0]['pid']), agent, body):
+        return None
+    return pis[0]['pid']
+
+
+def require_pi_pid(pane, body, why):
+    """Fail closed: without the exiting pi's pid the follower release cannot be awaited."""
+    seen = []
+    pid = wait_until(lambda: pane_pi_pid(pane, body, seen=seen), NEW_TIMEOUT)
+    if pid is None:
+        raise RuntimeError(f'pid de pi ambiguo o ausente (foreground={seen}); NO {why}')
+    return pid
+
+
+def process_env(pid):
+    try:
+        raw = Path(f'/proc/{pid}/environ').read_bytes()
+    except OSError:
+        return None
+    env = {}
+    for chunk in raw.split(b'\0'):
+        if b'=' in chunk:
+            key, value = chunk.split(b'=', 1)
+            env[key.decode(errors='replace')] = value.decode(errors='replace')
+    return env
+
+
+def office_env_ok(env, agent, body):
+    """True iff env is exactly this office's identity: PI_AGENT_NAME plus whatever
+    PI_CODING_* pairs equipo.json declares for this body (coding_env_pairs is the
+    single source of truth; never hardcode another team's literal key names here).
+    """
+    if not isinstance(env, dict) or env.get('PI_AGENT_NAME') != agent:
+        return False
+    return all(env.get(key) == value for key, value in coding_env_pairs(Path(body)))
+
+
+
+def telegram_state(body):
+    """Read-only view of the shared bus state; None when the body has no Telegram."""
+    if not (body / '.pi-agent' / 'telegram.json').is_file():
+        return None
+    try:
+        return json.loads((body / '.pi-agent' / 'tmp' / 'telegram' / 'state.json').read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def telegram_thread(state, body, session_id):
+    """threadId of the exact {cwd, sessionId} Workspace binding, or None."""
+    for item in (state or {}).get('workspaceBindings') or []:
+        if (isinstance(item, dict) and item.get('cwd') == str(body)
+                and item.get('sessionId') == session_id):
+            return (item.get('target') or {}).get('threadId')
+    return None
+
+
+def telegram_follower_thread(state, body, pid):
+    """threadId of the live follower registered by THIS pi pid for this body, or None."""
+    roster = ((state or {}).get('liveRoster') or {}).get('busFollowers') or []
+    for item in roster:
+        if (isinstance(item, dict) and item.get('cwd') == str(body) and item.get('status') == 'active'
+                and str(item.get('instanceId', '')).split(':')[0] == str(pid)):
+            return (item.get('target') or {}).get('threadId')
+    return None
+
+
+def wait_follower_released(body, pid, agent):
+    """R2: before a successor starts, the leader must have dropped the old pid's live follower.
+
+    pi-telegram restores a remembered Workspace only at session start; if the leader still
+    believes the exited owner is live, restore is refused (measured 2026-10-05 canary:
+    'workspace-binding-unavailable', dead confirmation ~13 s after /quit). Read-only.
+    """
+    if telegram_state(body) is None:
+        return
+    if not isinstance(pid, int):
+        raise RuntimeError(f'TELEGRAM {agent}: pid del follower saliente desconocido; NO arranco el sucesor')
+    released = wait_until(lambda: None if telegram_owner_live(telegram_state(body), body, pid)
+                          else True, TELEGRAM_WAIT)
+    if released is None:
+        raise RuntimeError(f'TELEGRAM {agent}: el líder sigue viendo vivo al follower pid={pid} '
+                           '(roster o registro de Thread activo); NO arranco el sucesor (no podría reconectarse solo)')
+    print(f'TELEGRAM {agent}: líder soltó al follower pid={pid}', flush=True)
+
+
+def telegram_owner_live(state, body, pid):
+    """True while the leader still lists this pid as live follower OR as active owner of a
+    Thread record (canary 4: roster cleared but the record stayed 'active', so restore failed)."""
+    if telegram_follower_thread(state, body, pid) is not None:
+        return True
+    for rec in (state or {}).get('threads') or []:
+        if (isinstance(rec, dict) and rec.get('status') == 'active'
+                and str(rec.get('instanceId', '')).split(':')[0] == str(pid)):
+            return True
+    return False
+
+
+def wait_until(check, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        value = check()
+        if value is not None or time.monotonic() >= deadline:
+            return value
+        time.sleep(POLL)
+
+
+def resume_professional(pane, agent, body, tab, creator, terminal, previous):
+    """R1/R2: prove the resumed session, its office env and that its follower reconnected alone.
+
+    Default (decision B, the human 2026-10-05): NO /new; the gate runs in the resumed session and
+    returns (previous, report). Only with OFICINA_NEW_EN_PROCESO=1 (off; pi-telegram 0.51.4
+    slot bug) it sends /new in process and returns (new_session_path, report).
+    Never sends /telegram-connect and never writes Telegram state; it only reads it.
+    Any failure is visible and opens nothing.
+    """
+    # 2026-10-15: pi tarda en cargar y reportar su sesión a herdr; esperar, no mirar una vez.
+    info = wait_until(lambda: pane_observation(pane, agent, body, tab, creator,
+                                               session_value=previous, terminal_id=terminal),
+                      NEW_TIMEOUT)
+    if info is None:
+        raise RuntimeError(f'REANUDACIÓN FALLIDA: el pane no retomó {previous}; NO abrir otra')
+    seen = []
+    pid = wait_until(lambda: pane_pi_pid(pane, body, agent, seen), NEW_TIMEOUT)
+    if pid is None:
+        raise RuntimeError(f'Pi reanudado sin entorno de oficina verificable (foreground={seen}); NO /new')
+    old_id = session_header_id(previous, body)
+    report = 'sin telegram'
+    state = telegram_state(body)
+    thread = None
+    if state is not None:
+        thread = telegram_thread(state, body, old_id)
+        if thread is None:
+            report = 'sin thread previo para la sesión retomada'
+            print(f'TELEGRAM {agent}: {report}; no mando /telegram-connect', flush=True)
+        else:
+            got = wait_until(lambda: telegram_follower_thread(telegram_state(body), body, pid),
+                             TELEGRAM_WAIT)
+            if got != thread and TELEGRAM_OPTIONAL:
+                report = f'AVISO sin Telegram: thread {thread} no restaurado (visto={got})'
+                print(f'TELEGRAM {agent}: {report}; OFICINA_TELEGRAM_OPCIONAL=1 => sigo SIN Telegram; '
+                      'NO /new, NO /telegram-connect, state intacto', flush=True)
+                thread = None  # no hay thread vivo que re-keyar en el camino /new
+            elif got != thread:
+                raise RuntimeError(f'TELEGRAM {agent}: follower pid={pid} no se reconectó solo al '
+                                   f'thread {thread} (visto={got}); NO /new, NO /telegram-connect')
+            else:
+                print(f'TELEGRAM {agent}: follower reconectado solo al thread {thread}', flush=True)
+    # M4: decide on a FRESH observation right before writing; the first one may be ~45 s old.
+    now = pane_observation(pane, agent, body, tab, creator, session_value=previous,
+                           terminal_id=terminal)
+    status = (now or {}).get('agent_status')
+    status = status.get('status') if isinstance(status, dict) else status
+    if now is None or status not in ('idle', 'done') or pane_pi_pid(pane, body, agent) != pid:
+        raise RuntimeError(f'Pi reanudado cambió o no está idle ({status}) justo antes de /new; NO /new')
+    if not NEW_IN_PROCESS:
+        # B: the gate runs in the resumed session; its Thread stays bound to the same sessionId.
+        print(f'REANUDADA {agent} sesion={previous} (B: sin /new; conserva conversación y thread)', flush=True)
+        return previous, report
+    run('herdr', 'pane', 'send-text', pane, '/new')
+    run('herdr', 'pane', 'send-keys', pane, 'Enter')
+
+    def new_session():
+        try:
+            cur = live_pane(pane)
+        except Exception:
+            return None
+        value = (cur.get('agent_session') or {}).get('value')
+        if (cur.get('pane_id') == pane and cur.get('tab_id') == tab
+                and cur.get('terminal_id') == terminal and cur.get('agent') == 'pi'
+                and cur.get('cwd') == str(body) and isinstance(value, str) and value != previous
+                and Path(value).parent == session_directory(body) and session_id_from_path(value)):
+            return value
+        return None
+    fresh = wait_until(new_session, NEW_TIMEOUT)
+    if fresh is None:
+        raise RuntimeError('/new sin sesión nueva confirmada en el mismo pane; NO gate')
+    if thread is not None:
+        new_id = session_id_from_path(fresh)
+        moved = wait_until(lambda: (telegram_thread(telegram_state(body), body, new_id) == thread
+                                    and telegram_follower_thread(telegram_state(body), body, pid) == thread)
+                           or None, TELEGRAM_WAIT)
+        report = (f'thread {thread} conservado (re-key {old_id} -> {new_id})' if moved else
+                  f'AVISO thread {thread} NO re-keyado a {new_id}; reportar, no tocar state')
+        print(f'TELEGRAM {agent}: {report}', flush=True)
+    print(f'REANUDADA {agent} sesion_previa={previous} sesion_nueva={fresh}', flush=True)
+    return fresh, report
+
+
+def post_reboot_state(pane, agent, item, creator):
+    """R3: 'recuperable' | 'working' | None for a registered pane running pi WITHOUT office env.
+
+    Provenance (same pane, same registered tab, cwd/foreground and process cwd = own body)
+    replaces the terminal check: a reboot restores the pane with a new terminal_id.
+    """
+    body = BASE / agent
+    if not isinstance(item, dict) or item.get('body') != str(body) or not pane or pane == creator:
+        return None
+    try:
+        info = live_pane(pane)
+    except Exception:
+        return None
+    pid = pane_pi_pid(pane, body)  # exactly one 'pi' with cwd = body; helpers ignored
+    if (info.get('pane_id') != pane or info.get('tab_id') != item.get('parent_tab_id')
+            or info.get('cwd') != str(body) or info.get('foreground_cwd') != str(body)
+            or info.get('agent') != 'pi' or pid is None):
+        return None
+    env = process_env(pid)
+    if env is None or office_env_ok(env, agent, body):
+        return None  # unreadable is unknown; full own env with another seal mismatch is not R3
+    status = info.get('agent_status')
+    status = status.get('status') if isinstance(status, dict) else status
+    return 'recuperable' if status in ('idle', 'done') else 'working'
+
+
+def recover_post_reboot(agent, item, creator):
+    """R3: clean /quit of the env-less idle pi, close ITS pane, archive; caller reopens (R1)."""
+    verified_team_pi(agent)  # QA 4c38abfc: if the team's pi is missing, abrir would fail AFTER /quit+close; not touched
+    pane = item['pane_id']
+    if post_reboot_state(pane, agent, item, creator) != 'recuperable':
+        raise RuntimeError(f'{agent}: estado cambió antes de recuperar; NO tocar')
+    old_pid = require_pi_pid(pane, BASE / agent, 'recuperar')  # bd6448fb (1)
+    # M4: fresh status right before writing /quit.
+    if post_reboot_state(pane, agent, item, creator) != 'recuperable' or pane_pi_pid(pane, BASE / agent) != old_pid:
+        raise RuntimeError(f'{agent}: cambió o dejó de estar idle justo antes de /quit; NO tocar')
+    verify_preflight_before_quit(agent, BASE / agent, old_pid)  # ddab4e90: preflight can fail BEFORE /quit
+    run('herdr', 'pane', 'send-text', pane, '/quit')
+    run('herdr', 'pane', 'send-keys', pane, 'Enter')
+
+    def exited():
+        try:
+            cur = live_pane(pane)
+            proc = pane_process(pane)
+        except Exception:
+            return None
+        if (cur.get('pane_id') == pane and cur.get('tab_id') == item.get('parent_tab_id')
+                and cur.get('cwd') == str(BASE / agent) and cur.get('agent') in (None, '')
+                and proc is not None and proc.get('name') in SHELLS
+                and proc.get('cwd') == str(BASE / agent)):
+            return cur
+        return None
+    if wait_until(exited, NEW_TIMEOUT) is None:
+        raise RuntimeError(f'{agent}: pi no salió limpio o el pane cambió; NO cerrar')
+    wait_follower_released(BASE / agent, old_pid, agent)
+    with registry_lock():
+        records = load()
+        if records.get(agent) != item:
+            raise RuntimeError(f'{agent}: registro cambió durante la recuperación; NO cerrar')
+        trash = Path.home() / '.trash'
+        trash.mkdir(parents=True, exist_ok=True)
+        backup = trash / f'registro-pre-recuperar-{agent}-{time.time_ns()}.json'
+        shutil.copy2(REGISTRY, backup)
+        if backup.read_bytes() != REGISTRY.read_bytes():
+            raise RuntimeError('Backup no verificado; NO cerrar')
+        if exited() is None:
+            raise RuntimeError(f'{agent}: pane cambió antes de cerrar; NO cerrar')
+        run('herdr', 'pane', 'close', pane)
+        gate = BASE / agent / 'state' / 'secretaria-gate-ok'
+        if gate.exists():
+            gate.rename(trash / f'secretaria-gate-closed-{agent}-{time.time_ns()}')
+        records.setdefault('_historico', []).append({
+            'agente': agent, 'registro': item,
+            'archivado_en': datetime.now(timezone.utc).isoformat(),
+            'motivo': 'pi sin entorno de oficina (post-reinicio); salida limpia y cierre supervisado',
+        })
+        del records[agent]
+        save(records)
+    print(f'RECUPERADA {agent}: pi sin entorno salió limpio, pane {pane} cerrado, '
+          f'registro archivado (backup={backup}); reabro retomando su sesión', flush=True)
+
+
+# ---- 0633f41d R3: relanzar en el MISMO pane que restauró herdr tras un reinicio ----
+def shell_children(pid):
+    """Child pids of a process (every thread's children file). Unreadable => None (unknown)."""
+    try:
+        tasks = list((PROC_ROOT / str(pid) / 'task').iterdir())
+        kids = []
+        for task in tasks:
+            kids += [int(x) for x in (task / 'children').read_text().split()]
+        return kids
+    except (OSError, ValueError):
+        return None
+
+
+def restored_shell_state(pane, agent, item, creator):
+    """(True, why) only for EXACTLY the post-reboot shape; else (False, why). Read-only.
+
+    The shape: the registered pane, in its registered tab, alive with NO agent, cwd and
+    foreground cwd = own body, the single foreground process is the pane's own shell
+    (fish/bash/zsh/sh, pid = shell_pid) with no children, and no 'pi' anywhere in the body.
+    terminal_id is NOT required to match: a restore gives the pane a new terminal.
+    """
+    body = BASE / agent
+    if not isinstance(item, dict) or item.get('body') != str(body):
+        return False, 'registro ausente o de otro cuerpo'
+    if not pane or not creator or pane == creator:
+        return False, 'pane registrado ausente o es el de la líder'
+    try:
+        info = live_pane(pane)
+        proc = payload(run('herdr', 'pane', 'process-info', '--pane', pane))['result']['process_info']
+    except Exception as exc:
+        return False, f'pane no observable ({type(exc).__name__})'
+    if info.get('pane_id') != pane or info.get('tab_id') != item.get('parent_tab_id'):
+        return False, 'pane o tab distintos al registro'
+    if info.get('cwd') != str(body) or info.get('foreground_cwd') != str(body):
+        return False, 'cwd del pane fuera del cuerpo'
+    if info.get('agent') not in (None, ''):
+        return False, f'el pane ya tiene agente ({info.get("agent")})'
+    procs = [p for p in (proc.get('foreground_processes') or []) if isinstance(p, dict)]
+    shell_pid = proc.get('shell_pid')
+    if (proc.get('pane_id') != pane or len(procs) != 1 or procs[0].get('name') not in SHELLS
+            or not isinstance(shell_pid, int) or procs[0].get('pid') != shell_pid
+            or procs[0].get('cwd') != str(body)):
+        return False, f'foreground no es solo la shell del pane ({[p.get("name") for p in procs]})'
+    kids = shell_children(shell_pid)
+    if kids is None or kids:
+        return False, f'la shell tiene hijos o no es legible ({kids})'
+    pids = pi_pids_in(body)
+    if pids is None or pids:
+        return False, f'hay pi vivo en el cuerpo o /proc ilegible ({pids})'
+    return True, 'shell restaurada, idle, sin pi'
+
+
+def relaunch_in_pane(agent):
+    """R3: start the office's pi in its OWN registered pane (restored by herdr, fish only), with
+    the full gate of abrir (pin preflight, ficha model/thinking/tools, APPEND_SYSTEM, --no-mcp,
+    previous --session), then reseal terminal_id/session. Never splits, closes or archives:
+    any doubt fails closed and leaves the pane as it was (visible)."""
+    ensure_session_root()
+    body, fields, append_system = office_launch_checks(agent, BASE / agent)
+    if body != BASE / agent:
+        raise ValueError('Cuerpo fuera del equipo o symlink; NO relanzar')
+    leader = os.environ.get('HERDR_PANE_ID')
+    if not leader:
+        raise RuntimeError('HERDR_PANE_ID no definido; NO relanzar en pane')
+    with registry_lock():
+        records = load()
+        creator = records.get('_creators', {}).get(LEADER)
+        if creator != leader:
+            raise RuntimeError('Pane de la líder no es el creador registrado; NO relanzar en pane')
+        item = records.get(agent)
+        pane = item.get('pane_id') if isinstance(item, dict) else None
+        ok, why = restored_shell_state(pane, agent, item, creator)
+        if not ok:
+            raise RuntimeError(f'{agent}: el pane no es una shell restaurada relanzable ({why}); NO tocar')
+        tab = item['parent_tab_id']
+        terminal = live_pane(pane).get('terminal_id')
+        if not isinstance(terminal, str) or not terminal:
+            raise RuntimeError(f'{agent}: pane sin terminal_id; NO relanzar')
+        resume = prior_session(agent, body, records) if relanzar_retoma() else None
+        print(f'SESIÓN {agent}: ' + (f'retomo {resume} (B, sin /new)' if resume
+                                     else 'sin sesión previa válida; sesión nueva'), flush=True)
+        print(f'RELANZO EN PANE {agent} pane={pane} tab={tab} terminal={terminal} '
+              f'(terminal registrada={item.get("terminal_id")})', flush=True)
+        prepare_pane_shell(pane, agent, body)  # exact export + preflight of the pin before pi
+        # re-check right before pi: the export must not have left anything running
+        ok, why = restored_shell_state(pane, agent, item, creator)
+        if not ok or live_pane(pane).get('terminal_id') != terminal:
+            raise RuntimeError(f'{agent}: el pane cambió tras el export ({why}); NO arrancar pi')
+        gate = body / 'state' / 'secretaria-gate-ok'
+        trash = Path.home() / '.trash'
+        trash.mkdir(exist_ok=True)
+        if gate.exists():
+            gate.rename(trash / f'secretaria-gate-stale-{agent}-{time.time_ns()}')
+        last_error = None
+        for attempt in range(5):
+            try:
+                pi_start_same_pane(agent, pane, fields, append_system, resume, terminal, body)
+                last_error = None
+                break
+            except RuntimeError as exc:
+                last_error = exc
+                if 'agent_pane_busy' not in str(exc):
+                    break
+                time.sleep(2)
+        if last_error:
+            raise RuntimeError(f'{agent}: pi no arrancó en el pane {pane} ({last_error}); '
+                               'pane intacto, registro sin cambios') from last_error
+        if resume:
+            resume_professional(pane, agent, body, tab, creator, terminal, resume)
+        try:
+            prompt_gate_with_stall_retry(pane, agent)
+        except Exception as exc:
+            raise RuntimeError(f'NO SE PUDO VERIFICAR: prompt sin respuesta ({exc}); registro sin cambios') from exc
+        gate_session = verify_probe(pane, agent)
+        if not session_model_ok(gate_session, fields):
+            raise RuntimeError('Gate: modelo/thinking de la sesión distintos a la ficha (fail-closed); registro sin cambios')
+        if (not isinstance(gate_session, str) or not gate_session
+                or not pane_provenance(pane, agent, body, tab, creator,
+                                       session_value=gate_session, terminal_id=terminal)):
+            raise RuntimeError('Sesión/terminal del gate no coinciden con el pane; registro sin cambios')
+        current = load()
+        if current.get(agent) != item:
+            raise RuntimeError(f'{agent}: el registro cambió durante el relanzado; NO resellar')
+        backup = trash / f'registro-pre-relanzar-en-pane-{agent}-{time.time_ns()}.json'
+        shutil.copy2(REGISTRY, backup)
+        if backup.read_bytes() != REGISTRY.read_bytes():
+            raise RuntimeError('Backup no verificado; NO resellar')
+        item = dict(item, session=gate_session, terminal_id=terminal)
+        current[agent] = item
+        save(current)
+        gate.parent.mkdir(parents=True, exist_ok=True)
+        gate.write_text(f'{pane}\n')
+    print(f'RELANZADA-EN-PANE {agent} pane={pane} tab={tab} terminal={terminal} '
+          f'sesion={gate_session} backup={backup}', flush=True)
+
+
+def entorno(agent):
+    """Read-only dry-run: ok | sin-entorno-idle | sin-entorno-working |
+    shell-restaurada | otro."""
+    with registry_lock():
+        records = load()
+    item = records.get(agent)
+    creator = records.get('_creators', {}).get(LEADER)
+    pane = item.get('pane_id') if isinstance(item, dict) else None
+    state = post_reboot_state(pane, agent, item, creator) if pane else None
+    if state:
+        print('sin-entorno-idle' if state == 'recuperable' else 'sin-entorno-working')
+        return
+    if pane and restored_shell_state(pane, agent, item, creator)[0]:
+        print('shell-restaurada')  # 0633f41d R3: relanzable en el mismo pane
+        return
+    ok = bool(pane) and pane_pi_pid(pane, BASE / agent, agent) is not None
+    print('ok' if ok else 'otro')
+
+
+RELOAD_TIMEOUT = float(os.environ.get('OFICINA_RELOAD_TIMEOUT', '90'))
+CONT_SETTLE = float(os.environ.get('OFICINA_CONT_SETTLE', '6'))
+CONT_PATTERN = re.compile(r'CONTINUIDAD \(session_start\)')  # aviso de cerebro-continuity.ts (loud)
+SNAPSHOT_LINES = '2000'
+
+
+def pane_snapshot(pane):
+    """Recent terminal lines, ONLY for in-memory pattern matching: never printed, stored or returned."""
+    try:
+        out = run('herdr', 'pane', 'read', pane, '--source', 'recent-unwrapped', '--lines', SNAPSHOT_LINES)
+    except Exception:
+        return None
+    return out.splitlines()
+
+
+def new_continuity_errors(pre, post):
+    """How many continuity warnings appeared AFTER the pre snapshot. None = cannot tell (fail-closed).
+
+    Anchor: a block of pre's chat lines (excluding the redrawn editor/footer tail) located in post;
+    only lines after it are new. Without an anchor, fall back to comparing total counts.
+    """
+    if pre is None or post is None:
+        return None
+    body_lines = pre[:-12] if len(pre) > 24 else pre[: max(0, len(pre) // 2)]
+    anchor = body_lines[-12:]
+    count = lambda lines: sum(1 for line in lines if CONT_PATTERN.search(line))
+    if anchor and any(x.strip() for x in anchor):
+        n = len(anchor)
+        for start in range(len(post) - n, -1, -1):
+            if post[start:start + n] == anchor:
+                return count(post[start + n:])
+    return max(0, count(post) - count(pre))
+
+
+def recargar(agent):
+    """74b85257 R3: /reload of an IDLE office in its sealed pane, so updated packages load.
+
+    Never the leader (allowlist = offices), never /new, never a working pi. The decision uses a
+    fresh sealed observation right before writing; the proof is the office's own
+    state/extensions-loaded-at marker changing while pane, terminal and session stay the same.
+    Exit codes for callers: 0 recargada, 3 working (pendiente, sin escribir), 1 error.
+    """
+    if agent not in AGENTS:
+        raise ValueError('Agente fuera de allowlist (la líder nunca se recarga sola)')
+    body = BASE / agent
+    with registry_lock():
+        records = load()
+    item = records.get(agent)
+    creator = records.get('_creators', {}).get(LEADER)
+    if not isinstance(item, dict) or not creator or item.get('body') != str(body):
+        raise RuntimeError('Registro incompleto o cuerpo ajeno; NO recargar')
+    pane, tab = item.get('pane_id'), item.get('parent_tab_id')
+    marker = body / 'state' / 'extensions-loaded-at'
+    if marker.is_symlink() or not marker.is_file():
+        raise RuntimeError('Sin marcador propio extensions-loaded-at: no podría probar la recarga; NO recargar')
+    def fresh():
+        info = sealed_observation(pane, agent, body, tab, creator, item)
+        if info is None:
+            raise RuntimeError(f'{ownership_error(item)}: {agent}; NO recargar')
+        status = info.get('agent_status')
+        return info, (status.get('status') if isinstance(status, dict) else status)
+    info, status = fresh()
+    if status not in ('idle', 'done'):
+        print(f'RECARGA {agent}: pi {status}; pendiente, no escribo', flush=True)
+        return 3
+    pid = pane_pi_pid(pane, body, agent)
+    if pid is None:
+        raise RuntimeError('Pi del pane sin entorno de oficina verificable; NO recargar')
+    info, status = fresh()  # M4: observación fresca justo antes de escribir
+    if status not in ('idle', 'done') or pane_pi_pid(pane, body, agent) != pid:
+        print(f'RECARGA {agent}: cambió a {status} justo antes de escribir; pendiente', flush=True)
+        return 3
+    def reload_once():
+        """One proven /reload. Returns new continuity warnings seen after it (None = unknown)."""
+        marker_before = marker.read_bytes()
+        pre = pane_snapshot(pane)
+        run('herdr', 'pane', 'send-text', pane, '/reload')
+        run('herdr', 'pane', 'send-keys', pane, 'Enter')
+
+        def reloaded():
+            try:
+                now = marker.read_bytes()
+            except OSError:
+                return None
+            if now == marker_before:
+                return None
+            cur = sealed_observation(pane, agent, body, tab, creator, item)
+            state = (cur or {}).get('agent_status')
+            state = state.get('status') if isinstance(state, dict) else state
+            return cur if cur is not None and state in ('idle', 'done') and pane_pi_pid(pane, body, agent) == pid else None
+        if wait_until(reloaded, RELOAD_TIMEOUT) is None:
+            raise RuntimeError(f'RECARGA {agent}: sin prueba de recarga (marcador sin cambio o pane/sesión distintos)')
+        # c093ecbd: the warning is async (session_start GET); poll for it for a short settle window.
+        seen = wait_until(lambda: (lambda n: n if n else None)(new_continuity_errors(pre, pane_snapshot(pane))),
+                          CONT_SETTLE)
+        return seen if seen else new_continuity_errors(pre, pane_snapshot(pane))
+
+    errors = reload_once()
+    note = 'continuidad=ok' if errors == 0 else 'continuidad=desconocida'
+    if errors:
+        # c093ecbd: medido 2026-10-05, el primer /reload tras actualizar avisó TypeError de continuidad en
+        # 4/5 oficinas y un segundo /reload no lo repitió. Reintento UNO, con las mismas guardas frescas.
+        info, status = fresh()
+        if status not in ('idle', 'done') or pane_pi_pid(pane, body, agent) != pid:
+            print(f'RECARGADA {agent} con AVISO de continuidad; no reintento: pi {status}', flush=True)
+            return 1
+        again = reload_once()
+        if again:
+            print(f'RECARGADA {agent} pane={pane} CONTINUIDAD persistente tras 1 reintento; reportar', flush=True)
+            return 1
+        note = 'continuidad=reintentada-ok' if again == 0 else 'continuidad=reintentada-desconocida'
+    print(f'RECARGADA {agent} pane={pane} pid={pid} sesion={item["session"]} {note}', flush=True)
+    return 0
+
+
+PROC_ROOT = Path(os.environ.get('OFICINA_PROC_ROOT', '/proc'))
+
+
+def pi_pids_in(body):
+    """Every process named 'pi' whose cwd is this body (herdr or not). Unreadable => None."""
+    found = []
+    try:
+        entries = list(PROC_ROOT.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            if (entry / 'comm').read_text().strip() == 'pi' and os.readlink(entry / 'cwd') == str(body):
+                found.append(int(entry.name))
+        except OSError:
+            continue  # process vanished or not ours
+    return found
+
+
+def estado_pi(name):
+    """74b85257: read-only, fresh. idle | working | sin-pi | desconocido for one body (leader or office).
+
+    'sin-pi' = no 'pi' process has this body as cwd: installing packages cannot race a live pi.
+    Any pi not explained by the registered pane, or any unknown, is 'desconocido' (do not touch).
+    """
+    if name == LEADER:
+        body = LEADER_BODY
+    elif name in AGENTS:
+        body = BASE / name
+    else:
+        raise ValueError('Cuerpo fuera del equipo')
+    try:
+        return _estado_pi(name, body)
+    except Exception:
+        return 'desconocido'  # O4: fail-closed; nunca 'idle' por una excepción
+
+
+def _estado_pi(name, body):
+    pids = pi_pids_in(body)
+    if pids is None:
+        return 'desconocido'
+    if not pids:
+        return 'sin-pi'
+    with registry_lock():
+        records = load()
+    creator = records.get('_creators', {}).get(LEADER)
+    try:
+        if name == LEADER:
+            info = live_pane(creator) if creator else None
+            ok = (isinstance(info, dict) and info.get('pane_id') == creator and info.get('agent') == 'pi'
+                  and info.get('cwd') == str(body) and info.get('foreground_cwd') == str(body))
+            pane = creator
+        else:
+            item = records.get(name)
+            info = sealed_observation(item.get('pane_id'), name, body, item.get('parent_tab_id'), creator,
+                                      item) if isinstance(item, dict) else None
+            ok, pane = info is not None, (item or {}).get('pane_id')
+        if not ok or pids != [pane_pi_pid(pane, body)]:
+            return 'desconocido'
+    except Exception:
+        return 'desconocido'
+    status = info.get('agent_status')
+    status = status.get('status') if isinstance(status, dict) else status
+    if status in ('idle', 'done'):
+        return 'idle'
+    return 'working' if status in ('working', 'blocked') else 'desconocido'
+
+
+def sesion_previa(agent):
+    """Read-only (dry-run helper): print the session R1 would resume, or 'ninguna'."""
+    with registry_lock():
+        records = load()
+    print(prior_session(agent, BASE / agent, records) or 'ninguna')
+
+
+def pane_observation(pane_id, agent, body, tab_id, creator, *, session_value=None,
+                     terminal_id=None):
+    """Return ONE verified pane get observation, or None. Never pair fields from two gets."""
+    if not pane_id or not creator or pane_id == creator or body != BASE / agent:
+        return None
+    try:
+        info = live_pane(pane_id)
+        session = info.get('agent_session') or {}
+        value = session.get('value')
+        if (info.get('pane_id') == pane_id and bool(info.get('tab_id'))
+                and (tab_id is None or info.get('tab_id') == tab_id)
+                and info.get('cwd') == str(body)
+                and info.get('foreground_cwd') == str(body)
+                and info.get('agent') == 'pi' and session.get('agent') == 'pi'
+                and session.get('kind') == 'path'
+                and valid_session_file(value, body)
+                and (session_value is None or value == session_value)
+                and (terminal_id is None or info.get('terminal_id') == terminal_id)):
+            return info
+    except (RuntimeError, KeyError, ValueError, OSError, TypeError):
+        pass
+    return None
+
+
+def pane_provenance(pane_id, agent, body, tab_id, creator, *, session_value=None, terminal_id=None):
+    """Check live ownership independently of any registry seal (for supervised sealing)."""
+    return pane_observation(pane_id, agent, body, tab_id, creator,
+                            session_value=session_value, terminal_id=terminal_id) is not None
+
+
+def sealed_observation(pane_id, agent, body, tab_id, creator, item):
+    """The opening gate's session and terminal, from the same live observation."""
+    if not isinstance(item, dict) or not isinstance(item.get('session'), str) or not item['session']:
+        return None
+    if not isinstance(item.get('terminal_id'), str) or not item['terminal_id']:
+        return None
+    return pane_observation(pane_id, agent, body, tab_id, creator,
+                            session_value=item['session'], terminal_id=item['terminal_id'])
+
+
+def sealed_office(pane_id, agent, body, tab_id, creator, item):
+    return sealed_observation(pane_id, agent, body, tab_id, creator, item) is not None
+
+
+def owned_office_pane(pane_id, agent, body, tab_id, creator, item):
+    return sealed_office(pane_id, agent, body, tab_id, creator, item)
+
+
+def no_seal(item):
+    return (not isinstance(item, dict) or not item.get('session') or not item.get('terminal_id'))
+
+
+def ownership_error(item):
+    return 'sin sello: usar `oficina sellar`' if no_seal(item) else 'propiedad no verificada'
+
+
+def split_pane_owned(pane_id, before_ids, tab_id, body, terminal_id, creator):
+    """Rollback only the pane returned by this split, absent beforehand and still that terminal."""
+    if not pane_id or pane_id == creator or pane_id in before_ids or not terminal_id:
+        return False
+    try:
+        info = live_pane(pane_id)
+        after = layout_of(pane_id)
+        return (info.get('pane_id') == pane_id and info.get('tab_id') == tab_id
+                and info.get('terminal_id') == terminal_id
+                and info.get('cwd') == str(body) and after.get('tab_id') == tab_id
+                and pane_id in {p['pane_id'] for p in after['panes']})
+    except (RuntimeError, KeyError, ValueError, OSError):
+        return False
+
+
+def layout_of(pane_id):
+    return payload(run('herdr', 'pane', 'layout', '--pane', pane_id))['result']['layout']
+
+
+def soul_frontmatter(soul_text, agent):
+    """Frontmatter del alma leida en el gate: texto crudo, o (a1d5394b) el objeto que devuelve
+    cb_vault_read con include_metadata=true, este SOLO si su path es exactamente el alma de la oficina."""
+    if soul_text.startswith('{'):
+        try:
+            obj = json.loads(soul_text)
+        except ValueError:
+            return ''
+        want = soul_path(agent)
+        if (not isinstance(obj, dict) or obj.get('path') not in (want, f'obsidian-vault/{want}')
+                or not isinstance(obj.get('content'), str)):
+            return ''
+        soul_text = obj['content']
+    return soul_text.split('---', 2)[1] if soul_text.startswith('---') and soul_text.count('---') >= 2 else ''
+
+
+def verify_probe(pane, agent):
+    # A receipt is scoped to this successful prompt attempt and consumed once.
+    # No expected challenge means NO certification, even if history looks valid.
+    challenge = OPENING_PROBES.pop((pane, agent), None)
+    if (not isinstance(challenge, dict)
+            or not isinstance(challenge.get('nonce'), str)
+            or not re.fullmatch(r'[0-9a-f]{32}', challenge['nonce'])
+            or challenge.get('prompt') != opening_probe_text(agent, challenge['nonce'])):
+        raise RuntimeError('GATE sin PROBE de esta apertura (fail-closed)')
+    info = payload(run('herdr', 'pane', 'get', pane))['result']['pane']
+    session = Path(info['agent_session']['value'])
+    if not session.is_file() or info['cwd'] != str(BASE / agent):
+        raise RuntimeError('Sesión del pane ausente o cwd ajeno')
+    messages = [json.loads(line)['message'] for line in session.read_text().splitlines()
+                if json.loads(line).get('type') == 'message']
+    system = next((m for m in messages if m.get('role') == 'system'), None)
+    _, _, fields = agent_ficha(agent)
+    # Check every system delta: extension tools can be registered after startup.
+    declarations = [t for m in messages if m.get('role') == 'system'
+                    for t in m.get('toolsAdded', [])] if system else []
+    names = [t.get('name') for t in declarations if isinstance(t, dict)]
+    tools_ok = bool(system and system.get('toolsAdded')) and bool(names) and len(names) == len(declarations) and all(
+        name in fields['allowed_tools'] for name in names) and OFFICE_EXTENSION_TOOLS.issubset(names) and not any(
+        name in names for name in SHELL_AND_WRITES - fields['allowed_tools'])
+    no_telegram = not any(isinstance(name, str) and 'telegram_' in name for name in names)
+    anchors = [i for i, m in enumerate(messages) if m.get('role') == 'user'
+               and probe_message_text(m) == challenge['prompt']]
+    # Per-attempt random nonce must identify exactly one user message, not a
+    # tool/assistant imitation or another request that happens to finish later.
+    if len(anchors) != 1:
+        raise RuntimeError('GATE PROBE nueva ausente/ambigua (fail-closed)')
+    fresh = messages[anchors[0] + 1:]
+    if any(m.get('role') == 'user' for m in fresh):
+        raise RuntimeError('GATE otra petición intercalada tras PROBE (fail-closed)')
+    who = [m for m in fresh if m.get('role') == 'toolResult' and m.get('toolName') == 'cb_whoami'
+           and not m.get('isError')]
+    soul = [m for m in fresh if m.get('role') == 'toolResult' and m.get('toolName') == 'cb_vault_read'
+            and not m.get('isError')]
+    assistants = [(i, m) for i, m in enumerate(fresh) if m.get('role') == 'assistant']
+    evidence_indices = [i for i, m in enumerate(fresh) if m.get('role') == 'toolResult'
+                        and m.get('toolName') in ('cb_whoami', 'cb_vault_read')]
+    model_ok = bool(assistants and evidence_indices
+                    and assistants[-1][0] > max(evidence_indices)
+                    and assistants[-1][1].get('stopReason') == 'stop'
+                    and not any(m.get('stopReason') in ('error', 'aborted') or m.get('errorMessage')
+                                for _, m in assistants)
+                    and not any(m.get('isError') for m in fresh if m.get('role') == 'toolResult'
+                                and m.get('toolName') in ('cb_whoami', 'cb_vault_read')))
+    text = lambda m: '\n'.join(c.get('text','') for c in m.get('content',[]) if c.get('type') == 'text')
+    who_text = text(who[-1]) if who else ''
+    soul_text = text(soul[-1]) if soul else ''
+    frontmatter = soul_frontmatter(soul_text, agent)
+    identity_ok = re.search(rf'^identidad_resuelta\s*:\s*{re.escape(agent)} \(subagente\)\s*$', who_text, re.M)
+    key_ok = re.search(rf'^origen_de_la_key\s*:\s*{re.escape(KEY_PREFIX + agent.upper().replace("-", "_"))}\s*$', who_text, re.M)
+    count = re.search(r'^tools_cb\s*:\s*(\d+) \(live\)', who_text, re.M)
+    soul_ok = re.search(rf'^agent:\s*{re.escape(agent)}\s*$', frontmatter, re.M)
+    print(f'GATE toolResult identity={bool(identity_ok)} soul={bool(soul_ok)} key={bool(key_ok)} '
+          f'tools_cb={count.group(1) if count else "0/no-live"} tools_ok={tools_ok} telegram={not no_telegram} '
+          f'fresh_probe=True model_ok={model_ok} session={session}', flush=True)
+    if not all((identity_ok, key_ok, count and int(count.group(1)) > 0, soul_ok, no_telegram, tools_ok, model_ok)):
+        raise RuntimeError('GATE TOOL RESULTS INCORRECTOS (fail-closed)')
+    return str(session)
+
+
+def session_model_ok(session, fields):
+    """Professional mode: the session's effective (last recorded) model and thinking = ficha."""
+    model = thinking = None
+    try:
+        with open(session) as fh:
+            for line in fh:
+                entry = json.loads(line)
+                if entry.get('type') == 'model_change':
+                    model = f"{entry.get('provider')}/{entry.get('modelId')}"
+                elif entry.get('type') == 'thinking_level_change':
+                    thinking = entry.get('thinkingLevel')
+    except (OSError, ValueError, TypeError):
+        return False
+    print(f'GATE modelo={model} thinking={thinking} ficha={fields["model"]}/{fields["thinking"]}', flush=True)
+    return model == fields['model'] and thinking == fields['thinking']
+
+
+def office_append_system(body, agent):
+    """Only own regular marker and prompt may be forwarded to Pi, before effects."""
+    if agent not in AGENTS or body != BASE / agent:
+        raise ValueError('APPEND_SYSTEM fuera del cuerpo propio')
+    local = body / '.pi'
+    marker = local / 'oficina-body'
+    prompt = local / 'APPEND_SYSTEM.md'
+    for path in (BASE, body, local, marker, prompt):
+        if path.is_symlink():
+            raise ValueError(f'APPEND_SYSTEM/marker con symlink: {path}')
+    if not local.is_dir():
+        raise ValueError('Directorio .pi inexistente')
+    for path in (marker, prompt):
+        if not path.is_file():
+            raise ValueError(f'APPEND_SYSTEM/marker ausente o no regular: {path}')
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise ValueError(f'APPEND_SYSTEM/marker ajeno o escribible por grupo/otros: {path}')
+    if marker.read_text() != 'pi-oficinas-v1\n':
+        raise ValueError('Marker de oficina propio inválido')
+    if f'<office_agent name="{agent}"/>' not in prompt.read_text():
+        raise ValueError('APPEND_SYSTEM sin tag propio de oficina')
+    return str(prompt)
+
+
+def office_launch_checks(agent, body):
+    """Everything abrir verifies about the body BEFORE any effect: ficha, APPEND_SYSTEM,
+    practitioner fichas, .env identity/key, declared agent dir and the team's pi.
+    Shared by abrir and relanzar-en-pane (0633f41d R3) so the two gates cannot drift.
+    Returns (resolved body, ficha fields, APPEND_SYSTEM path)."""
+    _, _, fields = agent_ficha(agent)
+    body = Path(body).resolve()
+    append_system = office_append_system(body, agent)
+    verify_practitioner_fichas(body, agent, fields['tools'])
+    if not (body / '.env').is_file():
+        raise ValueError('Cuerpo sin .env')
+    body_env = dict(line.split('=', 1) for line in (body / '.env').read_text().splitlines()
+                    if '=' in line and not line.lstrip().startswith('#'))
+    key_name = f'{KEY_PREFIX}{agent.upper().replace("-", "_")}'
+    if (not body_env.get(key_name) or body_env.get('AGENT_NAME') != agent
+            or body_env.get('SOUL_PATH') != soul_path(agent)
+            or {k for k in body_env if k.startswith(KEY_PREFIX)} != {key_name}
+            or TEAM['lider_key_env'] in body_env):
+        raise ValueError('Identidad/key del cuerpo no verificadas')
+    assert_declared_agent_dir(body)  # declared agent dir with auth/settings, before any split
+    verified_team_pi(agent)  # QA 4c38abfc: without the team's pi, nothing is created (no pane, no registry)
+    return body, fields, append_system
+
+
+def open_office(agent, body):
+    if Path(body) != BASE / agent or Path(body).is_symlink() or BASE.is_symlink():
+        raise ValueError('Cuerpo fuera del equipo o symlink; NO abrir')
+    config = read_distribution(DISTRIBUTION)  # configuration errors must precede split/gate
+    body, fields, append_system = office_launch_checks(agent, body)
+    with registry_lock():
+        records = load()
+        if agent in records:
+            raise RuntimeError('Oficina ya registrada; usar estado/cerrar, no crear otra')
+        assert_no_orphaned_panes(records)  # before split; fail closed on missing/mismatched pane IDs
+        print('censo por pane list: un pane omitido por herdr no es detectable')
+        resume = prior_session(agent, body, records) if relanzar_retoma() else None  # bd6448fb R1; modo fresco: sesión nueva
+        print(f'SESIÓN {agent}: ' + ((f'retomo {resume}' + (' y /new antes del gate' if NEW_IN_PROCESS else ' (B, sin /new)'))
+                                     if resume else 'sin sesión previa válida; sesión nueva'), flush=True)
+        pane = None
+        split_terminal = None
+        before_ids = set()
+        leader_tab = None
+        leader_pane = None
+        try:
+            leader_pane = os.environ.get('HERDR_PANE_ID')
+            if not leader_pane:
+                raise RuntimeError('HERDR_PANE_ID no definido; no partir un pane arbitrario')
+            layout = layout_of(leader_pane)
+            validate_layout(layout['area'], config['geometria'])
+            leader_tab = layout['tab_id']
+            before_ids = {p['pane_id'] for p in layout['panes']}
+            # Sólo considerar oficinas registradas, vivas y en la pestaña principal.
+            previous = [v for v in records.values()
+                        if isinstance(v, dict) and v.get('parent_tab_id') == leader_tab
+                        and v.get('pane_id') in {p['pane_id'] for p in layout['panes']}]
+            by_id = {p['pane_id']: p for p in layout['panes']}
+            parent, direction, ratio = choose_split(
+                [by_id[leader_pane], *(by_id[v['pane_id']] for v in previous)], leader_pane)
+            # F1: env of the pane = master pair + declared PI_CODING_* + pin (pane_split_env).
+            split_env = pane_split_env(agent, body)
+            response = payload(run('herdr', 'pane', 'split', '--pane', parent,
+                                   '--direction', direction, '--ratio', str(ratio),
+                                   '--cwd', str(body), *split_env, '--no-focus'))
+            result = response.get('result', response)
+            pane = result.get('pane_id') or result.get('pane', {}).get('pane_id')
+            if not pane or pane in before_ids:
+                raise RuntimeError('Split sin pane nuevo confirmado; inspección manual necesaria')
+            # Capture terminal provenance before starting pi; later cleanup must re-check it.
+            candidate = live_pane(pane)
+            split_terminal = candidate.get('terminal_id')
+            if not split_pane_owned(pane, before_ids, leader_tab, body, split_terminal, leader_pane):
+                raise RuntimeError('Propiedad no verificada del pane nuevo; inspección manual necesaria')
+            print(f'PANE creado pane={pane} parent={parent} tab={leader_tab}', flush=True)
+            prepare_pane_shell(pane, agent, body)  # exact export + preflight of the pin before pi
+            # A prior crash must not carry authorization into a new process.
+            gate = body / 'state' / 'secretaria-gate-ok'
+            if gate.exists():
+                trash = Path.home() / '.trash'
+                trash.mkdir(exist_ok=True)
+                gate.rename(trash / f'secretaria-gate-stale-{agent}-{time.time_ns()}')
+            last_error = None
+            for attempt in range(5):
+                try:
+                    pi_start(agent, pane, fields, append_system, resume)
+                    last_error = None
+                    break
+                except RuntimeError as exc:
+                    last_error = exc
+                    if 'agent_pane_busy' not in str(exc):
+                        break
+                    time.sleep(2)
+            if last_error:
+                raise last_error
+            if resume:
+                resume_professional(pane, agent, body, leader_tab, leader_pane, split_terminal, resume)
+            try:
+                prompt_gate_with_stall_retry(pane, agent)
+            except Exception as exc:
+                raise RuntimeError(f'NO SE PUDO VERIFICAR: prompt sin respuesta ({exc})') from exc
+            gate_session = verify_probe(pane, agent)
+            if not session_model_ok(gate_session, fields):
+                raise RuntimeError('Gate: modelo/thinking de la sesión distintos a la ficha (fail-closed)')
+            if (not isinstance(gate_session, str) or not gate_session
+                    or not pane_provenance(pane, agent, body, leader_tab, leader_pane,
+                                           session_value=gate_session, terminal_id=split_terminal)):
+                raise RuntimeError('Sesión/terminal del gate no coinciden con pane de apertura')
+            records.setdefault('_creators', {})[LEADER] = leader_pane
+            records[agent] = {'pane_id': pane, 'parent_tab_id': leader_tab,
+                              'body': str(body), 'session': gate_session,
+                              'terminal_id': split_terminal}
+            save(records)
+            gate.parent.mkdir(parents=True, exist_ok=True)
+            gate.write_text(f'{pane}\n')
+            print(f'ABIERTA {agent} pane={pane} tab={leader_tab}')
+        except Exception:
+            if pane:
+                try:
+                    diagnostic = run('herdr', 'pane', 'read', pane, '--source', 'recent-unwrapped', '--lines', '35')
+                    print(f'DIAGNÓSTICO pane_chars={len(diagnostic)} trust_prompt={"Trust this project" in diagnostic} pi_error={"Error" in diagnostic}', file=sys.stderr)
+                except Exception:
+                    pass
+                if split_pane_owned(pane, before_ids, leader_tab, body, split_terminal, leader_pane):
+                    run('herdr', 'pane', 'close', pane)
+                    print(f'CERRADO pane propio {pane} (gate fallido)', file=sys.stderr)
+                else:
+                    print(f'Propiedad no verificada del pane {pane}; NO cerrar, inspección manual', file=sys.stderr)
+            raise
+    # The gate and save succeeded; release the registry lock before ordenar takes it.
+    try:
+        ordenar()
+    except Exception as exc:
+        print(f'AVISO: ordenar falló; oficina abierta y verificada, NO cerrar: {exc}', file=sys.stderr)
+
+
+def owned_office_any_tab(pane_id, agent, body, creator, item):
+    """The same gate seal as close, accepting an office temporarily in another tab."""
+    return sealed_office(pane_id, agent, body, None, creator, item)
+
+
+def office_locations(records, tab):
+    """Fresh pane get per registered office; never infer location from move output."""
+    locations = {}
+    for name in ORDER:
+        item = records.get(name)
+        if not isinstance(item, dict):
+            continue
+        pane = item.get('pane_id')
+        try:
+            info = live_pane(pane)
+            locations[name] = f"{pane}@{info.get('tab_id', 'desconocido')}"
+        except Exception:
+            locations[name] = f'{pane}@desconocido'
+    return locations
+
+
+def verify_offices_in_tab(records, tab, offices):
+    """Final full census of registered offices, independent of layout or move output."""
+    locations = office_locations(records, tab)
+    missing = [f'{name}={location}' for name, location in locations.items()
+               if name not in offices or location != f'{offices[name]}@{tab}']
+    if missing:
+        raise RuntimeError('Oficinas fuera de pestaña del líder: ' + ', '.join(missing))
+
+
+def move_observed(pane, expected_tab, terminal, *options, ownership=None):
+    """Always query the real pane after move, even if the CLI response was lost."""
+    error = None
+    try:
+        run('herdr', 'pane', 'move', pane, *options)
+    except Exception as exc:
+        error = exc
+    try:
+        if ownership:
+            name, body, creator, item = ownership
+            info = sealed_observation(pane, name, body, expected_tab, creator, item)
+        else:
+            info = live_pane(pane)
+    except Exception as exc:
+        raise RuntimeError(f'Move {pane}: pane get falló ({exc}); '
+                           f'respuesta={error}; tab desconocido') from exc
+    if info is None:
+        raise RuntimeError(f'Move {pane}: identidad/sesión no verificadas; respuesta={error}')
+    real_tab = info.get('tab_id')
+    if (info.get('pane_id') != pane or not real_tab or
+            info.get('terminal_id') != terminal or
+            (expected_tab is not None and real_tab != expected_tab)):
+        raise RuntimeError(f'Move {pane}: tab real={real_tab}, esperado={expected_tab}; '
+                           f'terminal/identidad no verificadas; respuesta={error}')
+    if error:
+        raise RuntimeError(f'Move {pane}: respuesta perdida/error={error}; tab real={real_tab}') from error
+    return real_tab
+
+
+def apply_names(config, leader, tab, records, offices):
+    """Recheck the gate seal immediately before each rename, including no-move runs."""
+    names = config['nombres']
+    if not names and not config['pestana']:
+        return
+    for name, pane in [(LEADER, leader), *offices.items()]:
+        label = names.get(name)
+        if label is None:
+            continue
+        if name == LEADER:
+            info = live_pane(leader)
+            if info.get('pane_id') != leader or info.get('tab_id') != tab:
+                raise RuntimeError('Pane del líder cambió antes de renombrar')
+        else:
+            item = records[name]
+            info = sealed_observation(pane, name, Path(item['body']), tab, leader, item)
+            if info is None:
+                raise RuntimeError(f'{ownership_error(item)}: {name}; NO renombrar')
+        if info.get('label') != label:
+            run('herdr', 'pane', 'rename', pane, label)
+            print(f'RENOMBRADA {name} pane={pane} label={label}')
+    label = config['pestana']
+    if label:
+        info = live_pane(leader)
+        if info.get('pane_id') != leader or info.get('tab_id') != tab:
+            raise RuntimeError('Pane del líder cambió antes de renombrar pestaña')
+        tabs = payload(run('herdr', 'tab', 'list'))['result']['tabs']
+        matches = [t for t in tabs if t.get('tab_id') == tab]
+        if len(matches) != 1:
+            raise RuntimeError('Pestaña del líder no verificada antes de renombrar')
+        if matches[0].get('label') != label:
+            run('herdr', 'tab', 'rename', tab, label)
+            print(f'RENOMBRADA pestaña={tab} label={label}')
+
+
+def ordenar():
+    """Reconcile verified offices, then rebuild canonical L without rewriting registry."""
+    ensure_session_root()  # before recovery, moves or renames
+    config = read_distribution(DISTRIBUTION)  # invalid configuration must fail before moves/renames
+    geometry = config['geometria']
+    with registry_lock():
+        records = load()
+        leader = os.environ.get('HERDR_PANE_ID')
+        if not leader or records.get('_creators', {}).get(LEADER) != leader:
+            raise RuntimeError('Pane del líder no verificado; NO ordenar')
+        layout = layout_of(leader)
+        validate_layout(layout['area'], geometry)  # all declared cells, before recovery or moves
+        tab = layout['tab_id']
+        if live_pane(leader).get('tab_id') != tab:
+            raise RuntimeError('Pane del líder fuera de la pestaña; NO ordenar')
+        ids = {p['pane_id'] for p in layout['panes']}
+        if leader not in ids:
+            raise RuntimeError('Pane del líder ausente del layout')
+        offices = {}
+        terminals = {}
+        configured = set(geometry['columna_derecha'] + geometry['franja_inferior'])
+        if any(name in records and name not in configured for name in ORDER):
+            raise RuntimeError('Oficina registrada ausente de geometria; NO ordenar')
+        recovered = []
+        try:
+            # Check every registered office by ID, including those not in the leader's layout.
+            for name in ORDER:
+                item = records.get(name)
+                if not isinstance(item, dict):
+                    continue
+                if item.get('parent_tab_id') != tab:
+                    raise RuntimeError(f'Registro {name} apunta a tab ajena; NO ordenar')
+                pane = item.get('pane_id')
+                if not pane or pane == leader or pane in offices.values():
+                    raise RuntimeError(f'Dos registros reclaman el mismo pane o ID inválido: {name}')
+                body = Path(item.get('body', ''))
+                info = sealed_observation(pane, name, body, None, leader, item)
+                if info is None:
+                    raise RuntimeError(f'{ownership_error(item)}: {name} pane={pane}; NO tocar')
+                origin = info['tab_id']
+                offices[name] = pane
+                terminals[name] = item['terminal_id']
+                if origin != tab:
+                    recovered.append((name, origin))
+            recovered_names = {name for name, _ in recovered}
+            if ids != {leader, *(offices[name] for name in offices
+                                  if name not in recovered_names)}:
+                raise RuntimeError('Pane ajeno o no registrado en pestaña del líder; NO ordenar')
+            # Reconcile only after the complete ownership preflight.
+            for name, origin in recovered:
+                pane = offices[name]
+                current = sealed_observation(pane, name, Path(records[name]['body']), origin,
+                                             leader, records[name])
+                if current is None:
+                    raise RuntimeError(f'{ownership_error(records[name])}: cambió antes de recuperar {name}')
+                move_observed(pane, tab, terminals[name], '--tab', tab,
+                              '--target-pane', leader, '--split', 'right',
+                              '--ratio', str(leader_width(geometry)), '--no-focus',
+                              ownership=(name, Path(records[name]['body']), leader, records[name]))
+                print(f'RECUPERADA {name} de {origin} a {tab}')
+            layout = layout_of(leader)
+            ids = {p['pane_id'] for p in layout['panes']}
+            verify_offices_in_tab(records, tab, offices)
+            if ids != {leader, *offices.values()}:
+                raise RuntimeError('Pane ajeno o no registrado en pestaña del líder; NO ordenar')
+            if not offices:
+                apply_names(config, leader, tab, records, offices)
+                return
+            expected = expected_rects(offices, leader, layout['area'], geometry)
+            actual = {p['pane_id']: tuple(p['rect'][k] for k in ('x', 'y', 'width', 'height'))
+                      for p in layout['panes']}
+            if all(actual[pane] == expected[name] for name, pane in
+                   ((leader, leader), *((name, pane) for name, pane in offices.items()))):
+                verify_offices_in_tab(records, tab, offices)
+                print('ORDENADA: geometría L ya correcta; cero movimientos')
+                apply_names(config, leader, tab, records, offices)
+                return
+            moved = []
+            auxiliary = None
+            sequence = geometry['columna_derecha'] + geometry['franja_inferior']
+            for name in reversed([n for n in sequence if n in offices]):
+                pane = offices[name]
+                if sealed_observation(pane, name, Path(records[name]['body']), tab,
+                                      leader, records[name]) is None:
+                    raise RuntimeError(f'{ownership_error(records[name])}: cambió antes de mover {name}')
+                if auxiliary is None:
+                    auxiliary = move_observed(pane, None, terminals[name], '--new-tab',
+                                               '--label', 'oficina-ordenar-aux', '--no-focus',
+                                               ownership=(name, Path(records[name]['body']), leader, records[name]))
+                    if auxiliary == tab:
+                        raise RuntimeError('Move no creó pestaña auxiliar')
+                else:
+                    move_observed(pane, auxiliary, terminals[name], '--tab', auxiliary,
+                                  '--target-pane', offices[moved[-1]], '--split', 'right',
+                                  '--ratio', '.5', '--no-focus',
+                                  ownership=(name, Path(records[name]['body']), leader, records[name]))
+                moved.append(name)
+            pending = set(moved)
+            for name, target, direction, ratio in plan(offices, leader, geometry):
+                if {p['pane_id'] for p in layout_of(offices[next(iter(pending))])['panes']} != {
+                        offices[n] for n in pending}:
+                    raise RuntimeError('Auxiliar contiene panes inesperados; NO mover')
+                pane = offices[name]
+                if sealed_observation(pane, name, Path(records[name]['body']), auxiliary,
+                                      leader, records[name]) is None:
+                    raise RuntimeError(f'Pane {name} fuera del auxiliar; inspección manual')
+                dest = offices.get(target, target)
+                if target in offices:
+                    target_info = sealed_observation(dest, target, Path(records[target]['body']),
+                                                     tab, leader, records[target])
+                else:
+                    target_info = live_pane(dest) if dest == leader else None
+                if target_info is None or target_info.get('tab_id') != tab:
+                    raise RuntimeError(f'Target {target} fuera de pestaña del líder')
+                move_observed(pane, tab, terminals[name], '--tab', tab,
+                              '--target-pane', dest, '--split', direction,
+                              '--ratio', str(ratio), '--no-focus',
+                              ownership=(name, Path(records[name]['body']), leader, records[name]))
+                pending.remove(name)
+            verify_offices_in_tab(records, tab, offices)
+            final = layout_of(leader)
+            actual = {p['pane_id']: tuple(p['rect'][k] for k in ('x', 'y', 'width', 'height'))
+                      for p in final['panes']}
+            if any(actual.get(pane) != expected[name] for name, pane in
+                   ((leader, leader), *((name, pane) for name, pane in offices.items()))):
+                raise RuntimeError('Layout final no coincide con L; inspección manual, NO cerrar')
+            verify_offices_in_tab(records, tab, offices)
+            print(f'ORDENADA tab={tab} oficinas={len(offices)} auxiliar={auxiliary} auto-cerrado')
+            apply_names(config, leader, tab, records, offices)
+        except Exception as exc:
+            locations = office_locations(records, tab)
+            raise RuntimeError(f'Ordenar interrumpido: {exc}; ubicaciones={locations}; '
+                               'NO cerrar panes: inspección manual') from exc
+
+
+def levantar():
+    """Sequential supervised recovery; never close a live pane with a mismatched seal."""
+    ensure_session_root()  # before archive, opening or sorting
+    read_distribution(DISTRIBUTION)  # fail closed before any archive or opening
+    verified_team_pi()  # QA 4c38abfc: without the team's pi, nothing is archived, closed or opened
+    for _a in AGENTS:
+        verified_team_pi(_a)  # b6a85259: every per-body pin must run too
+    leader = os.environ.get('HERDR_PANE_ID')
+    if not leader:
+        raise RuntimeError('HERDR_PANE_ID no definido; NO levantar')
+    with registry_lock():
+        initial = load()
+        creator = initial.get('_creators', {}).get(LEADER)
+        if creator == leader:
+            assert_no_orphaned_panes(initial)  # before any archive/open in this recovery run
+            print('censo por pane list: un pane omitido por herdr no es detectable')
+    if creator != leader:
+        raise RuntimeError('Pane del líder no verificado; NO levantar')
+    mismatched = []
+    for name in ORDER:
+        with registry_lock():
+            item = load().get(name)
+        if isinstance(item, dict):
+            pane = item.get('pane_id')
+            try:
+                present = pane_exists(pane)
+            except Exception as exc:
+                raise RuntimeError(f'Presencia de {name} desconocida; NO levantar') from exc
+            if not present:
+                if not pane_confirmed_missing(pane):
+                    raise RuntimeError(f'Pane {name} no confirmado inexistente; NO archivar')
+                close(name)
+                print(f'LEVANTAR {name}: archivada; abriendo de a una')
+            elif sealed_observation(pane, name, Path(item.get('body', '')),
+                                    item.get('parent_tab_id'), leader, item) is not None:
+                print(f'LEVANTAR {name}: viva, sello OK')
+                continue
+            else:
+                r3 = post_reboot_state(pane, name, item, leader)  # bd6448fb R3
+                if r3 is None and restored_shell_state(pane, name, item, leader)[0]:
+                    print(f'LEVANTAR {name}: shell restaurada sin pi en {pane}: relanzo EN EL MISMO pane')
+                    relaunch_in_pane(name)  # 0633f41d R3; failure stops the loop, visible
+                    continue
+                if r3 == 'recuperable':
+                    print(f'LEVANTAR {name}: pi SIN entorno de oficina e idle en {pane}: recupero')
+                    recover_post_reboot(name, item, leader)  # failure stops the loop, visible
+                elif r3 == 'working':
+                    mismatched.append(name)
+                    print(f'LEVANTAR {name}: pi SIN entorno de oficina y TRABAJANDO; NO tocar, aviso')
+                    continue
+                else:
+                    mismatched.append(name)
+                    print(f'LEVANTAR {name}: sello distinto; NO tocar: cerrar + abrir supervisado')
+                    continue
+        if (BASE / name).is_dir():
+            open_office(name, BASE / name)  # gate failure stops the loop
+            print(f'LEVANTAR {name}: abierta')
+        else:
+            print(f'LEVANTAR {name}: sin cuerpo; omitida')
+    if mismatched:
+        print('LEVANTAR: ordenar omitido por sello distinto: ' + ', '.join(mismatched))
+    else:
+        ordenar()
+    print('LEVANTAR resumen: sello distinto=' + (', '.join(mismatched) or 'ninguno'))
+
+
+def sellar(agent, session_path):
+    """Backfill from the gate's externally retained session, never from a live pane alone."""
+    ensure_session_root()  # before registry, backup or seal
+    with registry_lock():
+        records = load()
+        item = records.get(agent)
+        if not isinstance(item, dict):
+            raise RuntimeError('Oficina no registrada; NO sellar')
+        if 'session' in item or 'terminal_id' in item:
+            raise RuntimeError('Oficina ya sellada o sello incompleto; NO sobrescribir')
+        creator = records.get('_creators', {}).get(LEADER)
+        pane = item.get('pane_id')
+        body = Path(item.get('body', ''))
+        if not isinstance(session_path, str) or not session_path:
+            raise RuntimeError('Ruta de sesión del gate requerida; NO sellar')
+        # A single pane get decides ownership AND supplies both persisted fields.
+        observed = pane_observation(pane, agent, body, item.get('parent_tab_id'), creator,
+                                    session_value=session_path)
+        if observed is None:
+            raise RuntimeError('Pane/sesión del gate no coinciden; NO sellar')
+        terminal = observed.get('terminal_id')
+        if not isinstance(terminal, str) or not terminal:
+            raise RuntimeError('Terminal ausente; NO sellar')
+        if not REGISTRY.is_file():
+            raise RuntimeError('Registro ausente; NO sellar')
+        trash = Path.home() / '.trash'
+        trash.mkdir(parents=True, exist_ok=True)
+        backup = trash / f'registro-pre-sellar-{agent}-{time.time_ns()}.json'
+        shutil.copy2(REGISTRY, backup)
+        if backup.read_bytes() != REGISTRY.read_bytes():
+            raise RuntimeError('Backup no verificado; NO sellar')
+        item['session'] = session_path
+        item['terminal_id'] = terminal
+        save(records)
+        print(f'SELLADA {agent} pane={pane} backup={backup}')
+
+
+class RelaunchSafetyError(RuntimeError):
+    """Pane identity or ownership changed; never retry across this boundary."""
+
+
+class RelaunchTransientObservation(RuntimeError):
+    """A pane observation is incomplete/inconsistent and may settle shortly."""
+
+
+def wait_for_relaunch_exit(observe, attempts=20, delay=.25, sleep=None):
+    """Retry post-/quit transient observations, but never cross pane identity changes."""
+    sleep = sleep or (lambda seconds: time.sleep(seconds))  # honors a monkeypatched time.sleep
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            current = observe()
+        except RelaunchSafetyError:
+            raise
+        except Exception as exc:
+            last_error = exc
+        else:
+            if current.get('agent') in (None, ''):
+                return current
+            last_error = RelaunchTransientObservation('Pi sigue presente después de /quit')
+        if attempt + 1 < attempts:
+            sleep(delay)
+    detail = str(last_error or 'observación no concluyente').replace('\n', ' ')[:240]
+    raise RelaunchTransientObservation(
+        f'No se confirmó la salida de pi tras {attempts} observaciones: {detail}') from last_error
+
+
+def record_relaunch_abort_after_quit(agent, records, item, gate, reason):
+    """Fail closed and persist that the registered office has no usable pi/gate."""
+    detail = str(reason).replace('\n', ' ')[:600]  # a82e464f: 240 cortaba el motivo (p.ej. «SIN GATE»)
+    trash = Path.home() / '.trash'
+    try:
+        trash.mkdir(parents=True, exist_ok=True)
+        if not REGISTRY.is_file():
+            raise RuntimeError('registro ausente')
+        backup = trash / f'registro-pre-relanzar-abortado-{agent}-{time.time_ns()}.json'
+        shutil.copy2(REGISTRY, backup)
+        if backup.read_bytes() != REGISTRY.read_bytes():
+            raise RuntimeError('backup de registro no verificado')
+        if gate.exists():
+            gate.rename(trash / f'secretaria-gate-abortado-{agent}-{time.time_ns()}')
+        item['gate_status'] = 'sin pi'
+        item['relaunch_status'] = 'abortado tras /quit'
+        item['relaunch_error'] = detail
+        item['relaunch_aborted_at'] = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        save(records)
+    except Exception as record_error:
+        message = (f'RELANZAMIENTO ABORTADO TRAS /quit: la oficina {agent} quedó sin pi; '
+                   f'gate no confiable; motivo={detail}; NO SE PUDO REGISTRAR ({record_error})')
+        print(message, file=sys.stderr)
+        raise RuntimeError(message) from record_error
+    message = (f'RELANZAMIENTO ABORTADO TRAS /quit: la oficina {agent} quedó sin pi; '
+               f'gate cerrado y estado registrado; motivo={detail}; relanzar supervisado')
+    print(message, file=sys.stderr)
+    raise RuntimeError(message)
+
+
+def relaunch_observation(pane, tab, terminal, body, creator):
+    """One fresh pane observation; no registry session seal is trusted for /new.
+
+    Every error here is RelaunchSafetyError (it is a RuntimeError): wait_for_relaunch_exit never
+    retries it, the same as the previous loop."""
+    info = live_pane(pane)
+    if (not pane or pane == creator or not terminal or
+            info.get('pane_id') != pane or info.get('tab_id') != tab or
+            info.get('terminal_id') != terminal or
+            info.get('cwd') != str(body) or info.get('foreground_cwd') != str(body)):
+        raise RelaunchSafetyError('Pane/tab/terminal/cwd distinto; NO relanzar')
+    agent = info.get('agent')
+    if agent not in (None, '', 'pi'):
+        raise RelaunchSafetyError('Pane ocupado por agente ajeno; NO relanzar')
+    if agent == 'pi':
+        session = info.get('agent_session') or {}
+        if (session.get('agent') != 'pi' or session.get('kind') != 'path' or
+                not valid_session_file(session.get('value'), body)):
+            raise RelaunchSafetyError('Sesión pi ajena o inválida; NO relanzar')
+        state = info.get('agent_status')
+        state = state.get('status') if isinstance(state, dict) else state
+        if state not in ('idle', 'done'):
+            raise RelaunchSafetyError(f'Pi no está idle ({state}); NO relanzar')
+    return info
+
+
+def prompt_gate_with_stall_retry(pane, agent):
+    """Each attempt gets a fresh challenge; only a successful prompt can certify it."""
+    OPENING_PROBES.pop((pane, agent), None)
+    for attempt in range(3):
+        nonce = uuid.uuid4().hex
+        prompt = opening_probe_text(agent, nonce)
+        try:
+            run('herdr', 'agent', 'prompt', pane, prompt, '--wait',
+                '--until', 'idle', '--until', 'done', '--timeout', '240000', timeout=250)
+            OPENING_PROBES[(pane, agent)] = {'nonce': nonce, 'prompt': prompt}
+            return
+        except RuntimeError as exc:
+            if 'agent_prompt_stalled' not in str(exc) or attempt == 2:
+                raise
+            run('herdr', 'agent', 'wait', pane, '--until', 'idle', '--timeout', '30000', timeout=35)
+
+
+def relanzar_retoma():
+    """Decision B in equipo.json: relanzar_modo='retomar' resumes the registered session (if it is
+    valid); 'fresco' or absent starts a new session (template default)."""
+    return isinstance(TEAM, dict) and TEAM.get('relanzar_modo', 'fresco') == 'retomar'
+
+
+def relanzar(agent, sin_reanudar=False, reanudar=None):
+    """Restart in the SAME registered pane; never close, move or replace the pane.
+
+    reanudar=None takes relanzar_modo from equipo.json. True/False (--reanudar / --sin-reanudar)
+    force it. Resuming always requires a valid session (prior_session); without one, it starts a
+    new session, with the previous behavior (bd6448fb)."""
+    if reanudar is None:
+        reanudar = False if sin_reanudar else relanzar_retoma()
+    sin_reanudar = not reanudar
+    ensure_session_root()
+    if agent not in AGENTS:
+        raise ValueError('Agente fuera de allowlist')
+    _, _, fields = agent_ficha(agent)
+    verified_team_pi(agent)  # QA 4c38abfc: without the team's pi, abort BEFORE /quit (the live pi is not touched)
+    with registry_lock():
+        records = load()
+        item = records.get(agent)
+        creator = records.get('_creators', {}).get(LEADER)
+        if not isinstance(item, dict) or not creator or os.environ.get('HERDR_PANE_ID') != creator:
+            raise RuntimeError('Registro o pane del líder no verificado; NO relanzar')
+        pane, tab, terminal = (item.get('pane_id'), item.get('parent_tab_id'),
+                               item.get('terminal_id'))
+        body = BASE / agent
+        append_system = office_append_system(body, agent)
+        if (item.get('body') != str(body) or not isinstance(item.get('session'), str)
+                or not item['session'] or not isinstance(terminal, str) or not terminal):
+            raise RuntimeError('Registro incompleto o cuerpo ajeno; NO relanzar')
+        observed = relaunch_observation(pane, tab, terminal, body, creator)
+        gate = body / 'state' / 'secretaria-gate-ok'
+        old_pid = None
+        # a82e464f (port from template): from the first possible restart effect (/quit, or start
+        # on a pane already without pi), any failure leaves a durable, explicit «no pi» state in
+        # the registry (record_relaunch_abort_after_quit). The registered session is NOT replaced.
+        registered_session = item['session']
+        restart_effect_possible = False
+        sealed_without_gate = False
+        try:
+            if observed.get('agent') == 'pi':
+                # /quit is the interactive pi command. Never send it to a working agent.
+                old_pid = require_pi_pid(pane, body, 'relanzar')  # bd6448fb (1): nunca None en silencio
+                relaunch_observation(pane, tab, terminal, body, creator)  # M4: fresca, justo antes de escribir
+                if pane_pi_pid(pane, body) != old_pid:
+                    raise RuntimeError('Pi del pane cambió antes de /quit; NO relanzar')
+                verify_preflight_before_quit(agent, body, old_pid)  # ddab4e90: preflight can fail BEFORE /quit
+                restart_effect_possible = True  # send-text may fail ambiguously after writing /quit
+                run('herdr', 'pane', 'send-text', pane, '/quit')
+                run('herdr', 'pane', 'send-keys', pane, 'Enter')
+                try:
+                    wait_for_relaunch_exit(lambda: relaunch_observation(pane, tab, terminal, body, creator))
+                except RelaunchTransientObservation as exc:
+                    raise RuntimeError(f'Pi no salió del pane; NO arrancar otro ({exc})') from exc
+            # After exit, a terminal swap or a new agent is never an invitation to start.
+            if relaunch_observation(pane, tab, terminal, body, creator).get('agent') not in (None, ''):
+                raise RuntimeError('Pane no está libre; NO relanzar')
+            restart_effect_possible = True  # starting on a pane already without pi is also an effect
+            # C: --sin-reanudar / modo fresco = sesión nueva (comportamiento previo).
+            resume = None if sin_reanudar else prior_session(agent, body, records)
+            if resume and observed.get('agent') == 'pi':
+                wait_follower_released(body, old_pid, agent)  # bd6448fb R2 (canario: carrera de restore)
+            prepare_pane_shell(pane, agent, body)  # F1: exact export + preflight of the pin, with the pane already free of pi
+            trash = Path.home() / '.trash'
+            trash.mkdir(exist_ok=True)
+            if gate.exists():
+                gate.rename(trash / f'secretaria-gate-stale-{agent}-{time.time_ns()}')
+            print(f'SESIÓN {agent}: ' + (f'retomo {resume}' + (' y /new antes del gate' if NEW_IN_PROCESS else ' (B, sin /new)')
+                                         if resume else ('--sin-reanudar: sesión nueva (C), sin /telegram-connect'
+                                                         if sin_reanudar else 'sin sesión previa válida; sesión nueva')), flush=True)
+            pi_start(agent, pane, fields, append_system, resume)
+            if resume:
+                try:
+                    resume_professional(pane, agent, body, tab, creator, terminal, resume)
+                except Exception as exc:
+                    raise RuntimeError(f'RELANZADA {agent} SIN GATE: {exc}; registro intacto '
+                                       f'(sesión {resume}); gate y bandeja cerrados') from exc
+            prompt_error = None
+            try:
+                prompt_gate_with_stall_retry(pane, agent)
+            except RuntimeError as exc:
+                prompt_error = exc
+            if prompt_error is None:
+                session = verify_probe(pane, agent)
+                if not session_model_ok(session, fields):
+                    raise RuntimeError('Gate: modelo/thinking de la sesión distintos a la ficha; NO re-sellar')
+                if not pane_provenance(pane, agent, body, tab, creator,
+                                       session_value=session, terminal_id=terminal):
+                    raise RuntimeError('Gate sin procedencia de pane/terminal; NO re-sellar')
+            else:
+                # The prompt did not pass the gate. Seal only a demonstrably NEW, owned
+                # session so close/relaunch can recover; never open the secretary gate.
+                observed = pane_observation(pane, agent, body, tab, creator,
+                                            terminal_id=terminal)
+                session = observed['agent_session']['value'] if observed else None
+                if not session or session == item['session']:
+                    raise RuntimeError(f'Gate fallido y sesión nueva sin procedencia; NO re-sellar ({prompt_error})')
+            # Backup exact registry bytes before updating the session and gate status.
+            if not REGISTRY.is_file():
+                raise RuntimeError('Registro ausente; NO re-sellar')
+            backup = trash / f'registro-pre-relanzar-{agent}-{time.time_ns()}.json'
+            shutil.copy2(REGISTRY, backup)
+            if backup.read_bytes() != REGISTRY.read_bytes():
+                raise RuntimeError('Backup no verificado; NO re-sellar')
+            old = item['session']
+            item['session'] = session
+            for key in ('relaunch_status', 'relaunch_error', 'relaunch_aborted_at'):
+                item.pop(key, None)
+            if prompt_error is not None:
+                item['gate_status'] = 'sin gate'
+            else:
+                item.pop('gate_status', None)
+            save(records)
+            if prompt_error is not None:
+                sealed_without_gate = True  # deliberate seal (new session, no gate): do not overwrite it
+                raise RuntimeError(f'RELANZADA {agent} SIN GATE: sesión nueva registrada {session}; '
+                                   f'gate y bandeja cerrados; relanzar/cerrar pueden recuperarla; '
+                                   f'backup={backup}; causa={prompt_error}') from prompt_error
+            gate.parent.mkdir(parents=True, exist_ok=True)
+            gate.write_text(f'{pane}\n')
+        except Exception as exc:
+            if restart_effect_possible and not sealed_without_gate:
+                item['session'] = registered_session  # never keep an unverified session
+                record_relaunch_abort_after_quit(agent, records, item, gate, exc)
+            raise
+        print(f'RELANZADA {agent} pane={pane} terminal={terminal} '
+              f'sesion_vieja={old} sesion_nueva={session} backup={backup}')
+
+
+def relanzar_todas():
+    """Use ONLY this team's ordered allowlist; stop at first denied gate.
+
+    Relaunch remains per-office and verifies live pane, creator and session before
+    each effect. No parallel pane operations and no implicit pane creation.
+    """
+    ensure_session_root()
+    with registry_lock():
+        records = load()
+        creator = records.get('_creators', {}).get(LEADER)
+        if not creator or os.environ.get('HERDR_PANE_ID') != creator:
+            raise RuntimeError('Líder no verificado; NO relanzar equipo')
+        for agent in ORDER:
+            item = records.get(agent)
+            if not isinstance(item, dict) or item.get('body') != str(BASE / agent):
+                raise RuntimeError(f'Oficina {agent} sin registro propio; NO relanzar equipo')
+    for agent in ORDER:
+        relanzar(agent)  # Verifica de nuevo justo antes del efecto; falla cerrado.
+
+
+def status(agent=None):
+    with registry_lock():
+        for name, item in load().items():
+            if name.startswith('_'):
+                continue
+            if agent and name != agent:
+                continue
+            print(f'{name}: {"abierta" if pane_exists(item["pane_id"]) else "no encontrada"} '
+                  f'pane={item["pane_id"]} tab={item["parent_tab_id"]}')
+
+
+def close(agent):
+    ensure_session_root()  # before archive, registry update or pane close
+    with registry_lock():
+        records = load()
+        if agent not in records:
+            raise RuntimeError('No registrada: no cerrar panes ajenos')
+        item = records[agent]
+        list_failed = False
+        if isinstance(item, dict):
+            pane_id = item.get('pane_id')
+            try:
+                missing = not pane_exists(pane_id)
+            except (RuntimeError, ValueError, KeyError, OSError):
+                missing = False
+                list_failed = True  # Unknown is not proof of presence or absence.
+            if missing and pane_confirmed_missing(pane_id):
+                # Intentional: without a seal, a CONFIRMED missing pane may be archived.
+                # No live pane is closed; blocking here would strand the office forever.
+                gate = Path(item['body']) / 'state' / 'secretaria-gate-ok'
+                if gate.exists():
+                    trash = Path.home() / '.trash'
+                    trash.mkdir(exist_ok=True)
+                    gate.rename(trash / f'secretaria-gate-closed-{agent}-{time.time_ns()}')
+                records.setdefault('_historico', []).append({
+                    'agente': agent, 'registro': item,
+                    'archivado_en': datetime.now(timezone.utc).isoformat(),
+                    'motivo': 'pane inexistente',
+                })
+                del records[agent]
+                save(records)
+                print(f'ARCHIVADA {agent}: pane {pane_id} ya no existe; no se cerró ningún pane')
+                return
+            if missing:
+                # An incomplete list cannot authorize either archive or close.
+                list_failed = True
+        creator = records.get('_creators', {}).get(LEADER)
+        if list_failed or not isinstance(item, dict) or not owned_office_pane(
+                item.get('pane_id'), agent, Path(item.get('body', '')),
+                item.get('parent_tab_id'), creator, item):
+            if isinstance(item, dict):
+                item['status'] = 'obsoleto'
+            save(records)
+            raise RuntimeError(f'{ownership_error(item)}; registro obsoleto; NO cerrar')
+        # The marker moves only after proof; a denied close leaves the office untouched.
+        run('herdr', 'pane', 'close', item['pane_id'])
+        gate = Path(item['body']) / 'state' / 'secretaria-gate-ok'
+        if gate.exists():
+            trash = Path.home() / '.trash'
+            trash.mkdir(exist_ok=True)
+            gate.rename(trash / f'secretaria-gate-closed-{agent}-{time.time_ns()}')
+        del records[agent]
+        save(records)
+        print(f'CERRADA {agent} pane={item["pane_id"]}')
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--equipo', type=Path, help='JSON version 2 del equipo')
+    subs = parser.add_subparsers(dest='cmd', required=True)
+    for command in ('crear', 'abrir', 'cerrar', 'estado', 'ordenar', 'sellar', 'levantar', 'relanzar', 'relanzar-todas',
+                    'sesion-previa', 'entorno', 'recargar', 'estado-pi', 'relanzar-en-pane'):
+        sub = subs.add_parser(command)
+        sub.add_argument('--equipo', dest='equipo_sub', type=Path, help='JSON version 2 del equipo')
+        if command == 'estado-pi':
+            sub.add_argument('cuerpo')  # incluye la líder: solo lectura
+        elif command not in ('ordenar', 'levantar', 'relanzar-todas'):
+            sub.add_argument('agente', nargs='?' if command == 'estado' else None)
+        if command == 'sellar':
+            sub.add_argument('--sesion', required=True, help='Ruta exacta de sesión impresa por el gate')
+        if command == 'abrir':
+            sub.add_argument('--cuerpo', type=Path, help='Cuerpo de prueba; sin modificar el principal')
+        if command == 'relanzar':
+            mode = sub.add_mutually_exclusive_group()
+            mode.add_argument('--reanudar', action='store_true',
+                              help='Retomar la sesión registrada (si es válida), aunque relanzar_modo sea fresco.')
+            mode.add_argument('--sin-reanudar', action='store_true',
+                              help='Recuperación manual: sesión nueva aunque haya previa (no retoma)')
+    args = parser.parse_args()
+    try:
+        selected = args.equipo_sub or args.equipo or os.environ.get('PI_OFICINAS_EQUIPO') or DEFAULT_PATH
+        select_team(load_equipo(args.equipo_sub or args.equipo))
+        os.environ['PI_OFICINAS_EQUIPO'] = str(selected)
+        if getattr(args, 'agente', None) is not None and args.agente not in AGENTS:
+            raise ValueError(f'Agente fuera de allowlist: {args.agente}')
+        if args.cmd == 'crear':
+            create(args.agente)
+        elif args.cmd == 'abrir':
+            open_office(args.agente, args.cuerpo or BASE / args.agente)
+        elif args.cmd == 'estado':
+            status(args.agente)
+        elif args.cmd == 'ordenar':
+            ordenar()
+        elif args.cmd == 'levantar':
+            levantar()
+        elif args.cmd == 'sellar':
+            sellar(args.agente, args.sesion)
+        elif args.cmd == 'relanzar':
+            relanzar(args.agente, reanudar=True if args.reanudar else False if args.sin_reanudar else None)
+        elif args.cmd == 'relanzar-todas':
+            relanzar_todas()
+        elif args.cmd == 'sesion-previa':
+            sesion_previa(args.agente)
+        elif args.cmd == 'entorno':
+            entorno(args.agente)
+        elif args.cmd == 'relanzar-en-pane':
+            relaunch_in_pane(args.agente)
+        elif args.cmd == 'recargar':
+            sys.exit(recargar(args.agente))
+        elif args.cmd == 'estado-pi':
+            print(estado_pi(args.cuerpo))
+        else:
+            close(args.agente)
+    except Exception as exc:
+        print(f'ERROR {exc}', file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

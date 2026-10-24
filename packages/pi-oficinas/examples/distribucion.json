@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "pestana": "Example team",
+  "nombres": {},
+  "geometria": {
+    "tipo": "L",
+    "lider_ancho": 0.6,
+    "franja_superior_alto": 0.7,
+    "columna_derecha": [
+      "worker"
+    ],
+    "franja_inferior": []
+  }
+}

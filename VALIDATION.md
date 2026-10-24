@@ -1,0 +1,78 @@
+# Validation and its limits
+
+Target: **Pi 1.4.0**, Python 3.14.7, Node 26.12.1 (contracts) / 26.10.0 (isolated Pi runners), npm 12.2.0, Gitleaks 8.30.1. These are observed test versions, not guarantees for every wildcard peer version. All workspaces, clean HOME directories and retained evidence are under `~/work`, never the live team bodies.
+
+## Observed final outcome
+
+| Check | Result |
+| --- | --- |
+| Focused contracts | 20/20 PASS, none skipped |
+| Test-harness boundaries | 3/3 refusals: live HOME for either driver; unmanaged Herdr caller |
+| Python shipping scripts | 5/5 AST PASS |
+| New archives | 5/5 packed and inspected; fixtures/private files excluded |
+| Independent extracted-package Pi prompts | 5/5 PASS |
+| Combined unconfigured/configured Pi prompts | PASS; configured tools visible in model request |
+| Packaged-CLI office opening | PASS with real Pi/Herdr, explicit model/backend doubles |
+| Isolated cleanup | Named session stop exit 0; server and model fixture exited |
+| Gitleaks directory / fresh Git history scans | 0 findings, no suppressions |
+| Git | Newly initialized, one local root commit, no inherited history, no remote/push |
+
+Package/archive inventories and hashes are in [FILES.md](FILES.md), [PACKAGES.md](PACKAGES.md) and `SHA256SUMS` (all public files except the checksum file itself and `.git`; verify with `sha256sum -c SHA256SUMS`). The final clean-HOME rerun reproduced all five recorded archive hashes. Raw logs, failed attempts, five archives and fixture transcripts are retained externally for review; they are not public package resources. Final drivers force `TMPDIR` beneath the test HOME and reject HOME outside the OS user’s `work` directory before writes/installation.
+
+## What is exercised
+
+- **20 focused contracts:** manifests/host peers, ordering without membership expansion, registered/catalog intersections, invalid configuration, high/unknown context deferral, session-bound snapshots, bounded relaunch grammar, explicit team configuration and credential-variable collision rejection, own office credentials, ambiguous delegation, safe prompt reads, durable plan ACK/attribution, failed ACK, restore failure and human review.
+- **Real Pi installation and prompts:** five archives from `npm pack`; literal tarball installation; each extracted package alone; all five together; configured leader tools shown in the actual model request. No extension-load errors in the supported route. All configuration and credentials for these tests are explicit test fixtures, not inherited cloud/backend credentials.
+- **Real office opening:** packaged Python CLI, real Pi and real Herdr in a unique named headless test session. The fresh gate checks tool results, own role/key-variable attribution, SOUL, active tools, session/model/thinking and pane ownership. The real registry and gate marker are inspected. Herdr’s official Pi integration is installed only in the test HOME; the test session/server is then stopped, without touching the caller’s session.
+- **Sanitation:** forbidden-reference/path scans, nonzero 12-digit account-format scan, resource/import/manifest/license checks and `gitleaks dir` (no rule suppression/baseline). The all-zero UUID in the authorization probe is a deliberately nonexistent task sentinel, not an AWS account.
+- **Fresh Git repository:** no upstream Git objects/history or remote, no push and no publication. `SOURCES.md` retains original hashes and source classes. `FILES.md` inventories the package files.
+
+### Known literal-tarball limitation
+
+Pi 1.4.0 accepts `pi install ./archive.tgz` and writes a local source with exit 0, but the ensuing `pi -p` rejects it as **unknown extension `.tgz`** (observed exit 1). Success of the install command is **not** a successful load.
+
+The test records this failure, removes those declarations, extracts each archive into a new directory and runs the supported `pi install /path/to/extracted/package`. Independently loaded packages and combined/configured prompts must then succeed. No host patch or alternate tarball disguise is used. The READMEs document this supported route; future registry installation uses `npm:@otixe/<package>@0.1.0` after publication.
+
+### What is NOT proved
+
+Model and backend are **loopback test doubles**. The fixture `cb_whoami`/`cb_vault_read` callbacks are synthetic and explicitly opt-in; they are excluded from all package tarballs. Their successful opening proves transcript/gate mechanics with controlled callbacks, **not** authentication/authorization to a production backend. No real cloud model, live office, VM or Telegram delivery is exercised. No cache hit rate/cost saving, complete mail delivery, automatic leader renewal, durable harvest or production deployment is claimed. Tests with disabled secretary timers do not prove every monitoring/correspondence scenario.
+
+Plan mode is a workflow gate: `bash`/`bg_run` remain usable and logged, other tools are not a complete write detector, and restore failure leaves visible idle rather than security protection.
+
+## Reproduce without live credentials
+
+Use a reviewed Pi 1.4.0 executable; do not install/update a live body runtime. Root scripts are test-only and not package resources. In Bash:
+
+```sh
+PI_BIN="$(command -v pi)"
+HERDR_BIN="$(command -v herdr)"
+HOST_MODULES="$(dirname "$(dirname "$PI_BIN")")"
+PUBLIC_ROOT="$PWD"
+mkdir -p "$HOME/work"
+
+# Native Node TypeScript tests; disposable files are retained under work.
+env -i HOME="$HOME" PATH=/usr/bin:/bin \
+  PI_TEST_WORK="$HOME/work" PI_TEST_RUNTIME="$HOST_MODULES" \
+  node --test "$PUBLIC_ROOT/tests/contracts.test.mjs"
+
+# Empty HOME: no inherited Pi settings or credentials. Five pack/install/load tests.
+CLEAN_HOME="$(mktemp -d -p "$HOME/work")"
+env -i HOME="$CLEAN_HOME" PATH=/usr/bin:/bin \
+  python3 "$PUBLIC_ROOT/tests/smoke.py" --pi "$PI_BIN"
+
+# Only run when the CALLER is already Herdr-managed. The driver controls ONLY
+# its own unique named test server, with socket/data paths beneath CLEAN_HOME.
+test "${HERDR_ENV:-}" = 1 && \
+  env -i HOME="$CLEAN_HOME" PATH=/usr/bin:/bin HERDR_ENV=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    python3 "$PUBLIC_ROOT/tests/open-office.py" --pi "$PI_BIN" --herdr "$HERDR_BIN"
+
+# Install Gitleaks from its verified official release; no secret suppressions.
+gitleaks dir "$PUBLIC_ROOT" --redact
+```
+
+Do not set `HERDR_ENV=1` to bypass an unmanaged caller: first verify the actual caller as shown. Retain stdout/stderr, archive manifests/hashes, `smoke/results.json`, `office-opening/result.json` and cleanup diagnostics. Failed attempts and the unsupported tarball path remain evidence, not deleted to create a green summary.
+
+## Rollback and residues
+
+Only these new source/test workspaces are affected. Remove each installed test source via `pi remove SOURCE`, reload/restart test Pi, and retain test sessions/markers/audit logs for review. The office test stops its unique server after checking ownership; it never closes an ambiguous live pane. Do not delete session evidence as an installation rollback. New test HOME directories, tarballs and historical red/green logs intentionally remain under `~/work`. Reviewers receive their local paths separately; those private absolute paths are not public artifacts.

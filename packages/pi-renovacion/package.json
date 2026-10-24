@@ -1,0 +1,50 @@
+{
+  "name": "@otixe/pi-renovacion",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "ai-agents",
+    "session-management",
+    "context-budget",
+    "multi-agent",
+    "claude",
+    "codex",
+    "llm",
+    "coding-agent",
+    "agent-orchestration"
+  ],
+  "description": "Warn long-running Pi agents about context pressure early and defer new tasks while saturated offices finish current work",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/otixe/pi-oficinas.git",
+    "directory": "packages/pi-renovacion"
+  },
+  "files": [
+    "extensions",
+    "lib",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "examples",
+    "README.es.md",
+    "media"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "image": "https://raw.githubusercontent.com/otixe/pi-oficinas/main/packages/pi-renovacion/media/preview.png",
+    "extensions": [
+      "./extensions/context-budget-alert.ts"
+    ],
+    "skills": [],
+    "prompts": [],
+    "themes": []
+  }
+}
