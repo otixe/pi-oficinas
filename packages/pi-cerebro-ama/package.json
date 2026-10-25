@@ -1,0 +1,62 @@
+{
+  "name": "@otixe/pi-cerebro-ama",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "description": "Keep eight essential memory tools direct and route the rest through codemode without borrowing another agent’s identity",
+  "keywords": [
+    "pi-package",
+    "ama",
+    "agent-memory-access",
+    "mcp",
+    "codemode",
+    "prompt-cache",
+    "claude",
+    "codex",
+    "llm",
+    "coding-agent",
+    "agent-orchestration"
+  ],
+  "author": "Otixe",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/otixe/pi-oficinas.git",
+    "directory": "packages/pi-cerebro-ama"
+  },
+  "homepage": "https://github.com/otixe/pi-oficinas/tree/main/packages/pi-cerebro-ama#readme",
+  "bugs": {
+    "url": "https://github.com/otixe/pi-oficinas/issues"
+  },
+  "files": [
+    "extensions",
+    "bin/measure-jsonl.py",
+    "lib",
+    "tests/cerebro-surface.test.mjs",
+    "tests/profiles.test.mjs",
+    "tests/measure.test.py",
+    "examples",
+    "README.md",
+    "README.es.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/cerebro-mcp.ts",
+      "./extensions/herramientas-activar.ts"
+    ],
+    "skills": [],
+    "prompts": [],
+    "themes": []
+  }
+}

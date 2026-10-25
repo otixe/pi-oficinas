@@ -26,7 +26,7 @@ pi install ./packages/pi-oficinas
 
 ## Elegí el dolor que querés resolver
 
-Empezá con un paquete o combinalos. Cada uno tiene README bilingüe, configuración propia y una vista de su flujo.
+Empezá con un paquete o combiná módulos compatibles. Cada uno tiene README bilingüe, configuración propia y una vista de su flujo. AMA reemplaza puente Cerebro/activador: no lo cargues junto a otra copia de esas extensiones.
 
 | Paquete | Qué mejora | Configuración |
 | --- | --- | --- |
@@ -35,10 +35,11 @@ Empezá con un paquete o combinalos. Cada uno tiene README bilingüe, configurac
 | [`@otixe/pi-renovacion`](packages/pi-renovacion/README.es.md) | Detectá presión de contexto y diferí nuevas tareas mientras termina el trabajo actual | `CONTEXT_ALERT`, `CONTEXT_WINDOW`, `CONTEXT_ALERT_PCT`; dependencias de relanzamiento inyectadas |
 | [`@otixe/pi-plan-gate`](packages/pi-plan-gate/README.es.md) | Convertí “primero planificá” en un plan confirmado y una revisión humana trazable | Variables `PLAN_GATE_*` y endpoints de checkpoint/tareas compatibles |
 | [`@otixe/pi-herramientas`](packages/pi-herramientas/README.es.md) | Empezá con un catálogo compacto y activá tools registradas cuando la tarea las necesita | `.pi/herramientas.json` |
+| [`@otixe/pi-cerebro-ama`](packages/pi-cerebro-ama/README.es.md) | Conservá ocho tools cotidianas de memoria directas para subagentes o hasta catorce para líderes; llamá las opcionales permitidas por codemode | Equipo/key propia explícitos, `.pi/herramientas.json`, `.pi/cerebro-surface.json` |
 
 ## Instalación
 
-Probado con Pi **1.4.0**. Las cinco bibliotecas provistas por el host son `peerDependencies: "*"`, nunca dependencias ordinarias. La CLI de oficinas necesita Python 3.10+ y Herdr. Instalá la integración oficial de Pi en el HOME de prueba/usuario revisado (`herdr integration install pi`): el gate necesita el reporte nativo de sesión/status y falla si falta. Los contratos con TypeScript nativo requieren Node 24+; Pi carga TypeScript mediante su loader de extensiones.
+Probado con Pi **1.4.0**. Los cinco paquetes originales declaran las cinco bibliotecas del host como `peerDependencies: "*"`; AMA declara solo sus dos peers necesarios, también wildcard. No se incluyen copias del host ni dependencias ordinarias. La CLI de oficinas necesita Python 3.10+ y Herdr. Instalá la integración oficial de Pi en el HOME de prueba/usuario revisado (`herdr integration install pi`): el gate necesita el reporte nativo de sesión/status y falla si falta. Los contratos con TypeScript nativo requieren Node 24+; Pi carga TypeScript mediante su loader de extensiones.
 
 Sumá los paquetes que necesita tu flujo:
 
@@ -48,6 +49,8 @@ pi install ./packages/pi-herramientas
 ```
 
 Un paquete local no crea un enlace npm al binario; podés usar `python3 packages/pi-oficinas/bin/oficina --equipo FILE ...`.
+
+Para AMA, usá `pi install ./packages/pi-cerebro-ama` **en reemplazo del activador de herramientas y del puente Cerebro previo**, no además de ellos. Seguí su migración/rollback. Su script JSONL offline compara entrada/costo de sesiones nuevas baseline/AMA por casa y rol sin llamar al proveedor.
 
 ## Configurar
 

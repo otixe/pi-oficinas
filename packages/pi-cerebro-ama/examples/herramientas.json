@@ -1,0 +1,27 @@
+{
+  "base": [
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "codemode",
+    "cb_whoami",
+    "cb_correspondencia_resumen",
+    "cb_task_get",
+    "cb_task_comment",
+    "cb_task_submit",
+    "cb_vault_read",
+    "cb_memory_add",
+    "cb_memory_search"
+  ],
+  "grupos": {
+    "cerebro": {
+      "linea": "Optional memory capabilities via codemode; authorization stays server-side",
+      "tools": [
+        "cb_task_activity",
+        "cb_checkpoint_agent_save",
+        "cb_checkpoint_agent_latest"
+      ]
+    }
+  }
+}

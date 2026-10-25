@@ -26,7 +26,7 @@ pi install ./packages/pi-oficinas
 
 ## Pick the pain you want to solve
 
-Start with one package or combine them. Each has its own bilingual README, configuration and workflow preview.
+Start with one package or combine compatible modules. Each has its own bilingual README, configuration and workflow preview. AMA replaces the Cerebro bridge/activator, so do not load it alongside another copy of those extensions.
 
 | Package | What gets better | Configuration |
 | --- | --- | --- |
@@ -35,10 +35,11 @@ Start with one package or combine them. Each has its own bilingual README, confi
 | [`@otixe/pi-renovacion`](packages/pi-renovacion/README.md) | Spot context pressure early and keep new tasks away from saturated offices while current work finishes | `CONTEXT_ALERT`, `CONTEXT_WINDOW`, `CONTEXT_ALERT_PCT`; injected relaunch dependencies |
 | [`@otixe/pi-plan-gate`](packages/pi-plan-gate/README.md) | Turn “plan first” into an acknowledged plan and a traceable human review | `PLAN_GATE_*` variables and compatible checkpoint/task endpoints |
 | [`@otixe/pi-herramientas`](packages/pi-herramientas/README.md) | Start with a compact tool catalog and bring in registered tools when the task needs them | `.pi/herramientas.json` |
+| [`@otixe/pi-cerebro-ama`](packages/pi-cerebro-ama/README.md) | Keep eight everyday memory tools direct for subagents or up to fourteen for leaders; call permitted optional capabilities through codemode | Explicit team/own key, `.pi/herramientas.json`, `.pi/cerebro-surface.json` |
 
 ## Requirements and installation
 
-Test target: Pi **1.4.0**. The packages declare the five host libraries as `peerDependencies: "*"`, with no bundled host copies. Python 3.10+ and Herdr are needed for the office CLI. Install Herdr's official Pi integration in your reviewed test/user HOME (`herdr integration install pi`) so native session/status reporting is available; the opening gate fails without it. Node's direct TypeScript test runner requires Node 24+; Pi itself loads TypeScript through its extension loader.
+Test target: Pi **1.4.0**. The original five packages declare the five host libraries as `peerDependencies: "*"`; AMA declares only its two required host peers, also wildcard. No host copies are bundled. Python 3.10+ and Herdr are needed for the office CLI. Install Herdr's official Pi integration in your reviewed test/user HOME (`herdr integration install pi`) so native session/status reporting is available; the opening gate fails without it. Node's direct TypeScript test runner requires Node 24+; Pi itself loads TypeScript through its extension loader.
 
 Add the packages that fit your workflow:
 
@@ -48,6 +49,8 @@ pi install ./packages/pi-herramientas
 ```
 
 The CLI can be called directly with Python, or through the `oficina` bin link when installed by npm. Pi's local package installation does not create an npm bin link.
+
+For AMA, use `pi install ./packages/pi-cerebro-ama` **instead of the herramientas activator and prior Cerebro bridge**, not in addition to them. Follow its migration/rollback instructions. Its offline JSONL measurement script compares new-session baseline/AMA usage by house and role without calling a provider.
 
 ## Configuration
 

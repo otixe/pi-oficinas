@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "lider": "demo",
+  "lider_key_env": "DEMO_KEY",
+  "office_key_prefix": "DEMO_KEY_",
+  "base": "/absolute/path/to/your/team",
+  "lider_body": "/absolute/path/to/your/team/demo",
+  "soul_prefix": "50 Agents/Demo",
+  "oficinas": ["demo-author", "demo-reviewer"],
+  "distribucion": "distribucion.json"
+}

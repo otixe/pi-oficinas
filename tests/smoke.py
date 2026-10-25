@@ -29,7 +29,11 @@ try:
     base=(work/'endpoint.txt').read_text();env['PI_SMOKE_ENDPOINT']=base+'/v1'
     prompt_args=[pi,'-p','-e',str(root/'tests/mock-provider.ts'),'--model','offline-smoke/fixture','--thinking','off','Package load smoke']
     archives=[]
-    for package in sorted((root/'packages').iterdir()):
+    # AMA is a replacement bridge/activator, not a sixth member of this combined loadout.
+    # Its packaged contracts and separate no-provider SDK acceptance cover that route.
+    original_packages=[p for p in sorted((root/'packages').iterdir()) if p.name!='pi-cerebro-ama']
+    assert {p.name for p in original_packages}=={'pi-oficinas','pi-cache-estable','pi-renovacion','pi-plan-gate','pi-herramientas'}
+    for package in original_packages:
         r=run('pack-'+package.name,['npm','pack','--json','--pack-destination',str(artifacts)],package)
         packed=json.loads(r.stdout);record=packed[0] if isinstance(packed,list) else next(iter(packed.values()))
         assert all(not any(part in ['node_modules','__pycache__','tests'] for part in Path(f['path']).parts) and '.bak' not in f['path'] and not f['path'].endswith('.pyc') and Path(f['path']).name!='.env' for f in record['files']),record['files']

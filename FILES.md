@@ -1,6 +1,6 @@
 # Package file inventory
 
-Exact source files per package; archives contain these plus npm-normalized package metadata. Test fixtures and private evidence are not shipped. The five packages contain **80 files** in total.
+Exact source files per package; archives contain these plus npm-normalized package metadata. Test fixtures and private evidence are not shipped. The six packages contain **99 files** in total.
 
 ## Repository-only resources (not shipped)
 
@@ -8,7 +8,7 @@ Root: `.gitignore`, `CHANGELOG.md`, `FILES.md`, `LICENSE`, `PACKAGES.md`, `READM
 
 Test harness: `tests/contracts.test.mjs`, `tests/fixture-server.py`, `tests/mock-cerebro.ts`, `tests/mock-provider.ts`, `tests/open-office.py`, `tests/smoke.py`.
 
-`SHA256SUMS` covers every public checkout file except itself and `.git` (96 entries). Archive hashes and sizes are in `PACKAGES.md`. Tarballs, logs, fixture transcripts and clean test HOME directories remain outside this checkout.
+`SHA256SUMS` covers every public checkout file except itself and `.git` (115 entries). Archive hashes and sizes are in `PACKAGES.md`. Tarballs, logs, fixture transcripts and clean test HOME directories remain outside this checkout.
 
 ## @otixe/pi-cache-estable (16 files)
 
@@ -29,6 +29,30 @@ lib/tools-order.ts
 lib/tools-runtime-coherence.ts
 media/preview.png
 package.json
+```
+
+## @otixe/pi-cerebro-ama (19 files)
+
+```text
+CHANGELOG.md
+LICENSE
+README.es.md
+README.md
+bin/measure-jsonl.py
+examples/cerebro-surface.json
+examples/equipo.example.json
+examples/herramientas.json
+examples/measurement.json
+extensions/cerebro-mcp.ts
+extensions/herramientas-activar.ts
+lib/cerebro-identity.ts
+lib/cerebro-surface.ts
+lib/herramientas-activar.ts
+lib/team-config.ts
+package.json
+tests/cerebro-surface.test.mjs
+tests/measure.test.py
+tests/profiles.test.mjs
 ```
 
 ## @otixe/pi-herramientas (9 files)

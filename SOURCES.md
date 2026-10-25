@@ -43,6 +43,11 @@ Host target: Pi 1.4.0. Local private paths, actual identities and credentials ar
 | current leader body | `lib/tools-order-runtime.ts` | `c1fe6b3aa46990b81a5a6c6b0cb54a406e7333d15ab1b17b8f3970ae4da3f301` |
 | current leader body | `lib/tools-runtime-coherence.ts` | `57da69def92975b1a77e6a3d1ff4c69f268802777058aab02644b0e8747509fb` |
 | current leader body | `lib/herramientas-activar.ts` | `266d5630508674a009359be30973ea02880c5e43f42875dda57875c79c56c9bb` |
+| reviewed AMA delivery | `extensions/cerebro-mcp.ts` | `c8c5cd54336bf5c5ec612b87b665c33cbf727bae8b74f4351a76f3f03732c987` |
+| reviewed AMA delivery | `extensions/herramientas-activar.ts` | `180ece74983e595037b58b8bb02198b3b86cf73dd7c949835e020a567dfd6c24` |
+| reviewed AMA delivery | `lib/cerebro-surface.ts` | `cd4866ee3d00bcd00355f60a944fe6c6aee401eed283ca5b204caa40bfd65a1a` |
+
+AMA public extraction removes standalone internal audit comments, uses the host `typebox` peer and a package build marker, and reuses the reviewed explicit-team identity/configuration modules from the office package. Fleet deployment uses the reviewed private postimages, not the sanitized distribution. AMA changes exposure, not dispatch credentials or server RBAC. Its JSONL measurement utility is new standalone Python with synthetic offline tests. The leader/subagent correction adds strict profile parsing, a capped usage-derived leader core and profile-aware optional projection; it does not change the original eleven contracts. The seven-day census counts completed direct/nested call records, including failed attempts, excludes incomplete/inherited/duplicate records, and does not export arguments or infer calls from code strings. Measurement v2 partitions profiles independently of the AMA cutoff and does not compare across profiles. New leader-only private postimages are derived surgically from each actual reviewed preimage; older office variants remain unchanged.
 
 The cache census identity is diagnostic only. The plan package uses its own small
 configured transport/principal adapter instead of shipping an entire backend client.

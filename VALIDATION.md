@@ -15,7 +15,7 @@ Target: **Pi 1.4.0**, Python 3.14.7, Node 26.12.1 (contracts) / 26.10.0 (isolate
 | Packaged-CLI office opening | PASS with real Pi/Herdr, explicit model/backend doubles |
 | Isolated cleanup | Named session stop exit 0; server and model fixture exited |
 | Gitleaks directory / fresh Git history scans | 0 findings, no suppressions |
-| Git | Newly initialized, one local root commit, no inherited history, no remote/push |
+| Git | Sanitized history; two existing local commits and a public origin configured. AMA remains an uncommitted candidate; this delivery performed no commit, push or publication |
 
 Package/archive inventories and hashes are in [FILES.md](FILES.md), [PACKAGES.md](PACKAGES.md) and `SHA256SUMS` (all public files except the checksum file itself and `.git`; verify with `sha256sum -c SHA256SUMS`). The final clean-HOME rerun reproduced all five recorded archive hashes. Raw logs, failed attempts, five archives and fixture transcripts are retained externally for review; they are not public package resources. Final drivers force `TMPDIR` beneath the test HOME and reject HOME outside the OS user’s `work` directory before writes/installation.
 
@@ -25,7 +25,7 @@ Package/archive inventories and hashes are in [FILES.md](FILES.md), [PACKAGES.md
 - **Real Pi installation and prompts:** five archives from `npm pack`; literal tarball installation; each extracted package alone; all five together; configured leader tools shown in the actual model request. No extension-load errors in the supported route. All configuration and credentials for these tests are explicit test fixtures, not inherited cloud/backend credentials.
 - **Real office opening:** packaged Python CLI, real Pi and real Herdr in a unique named headless test session. The fresh gate checks tool results, own role/key-variable attribution, SOUL, active tools, session/model/thinking and pane ownership. The real registry and gate marker are inspected. Herdr’s official Pi integration is installed only in the test HOME; the test session/server is then stopped, without touching the caller’s session.
 - **Sanitation:** forbidden-reference/path scans, nonzero 12-digit account-format scan, resource/import/manifest/license checks and `gitleaks dir` (no rule suppression/baseline). The all-zero UUID in the authorization probe is a deliberately nonexistent task sentinel, not an AWS account.
-- **Fresh Git repository:** no upstream Git objects/history or remote, no push and no publication. `SOURCES.md` retains original hashes and source classes. `FILES.md` inventories the package files.
+- **Sanitized Git repository:** no inherited upstream source history. The existing public origin is left unchanged; this AMA delivery makes no commit, push or publication. `SOURCES.md` retains original hashes and source classes. `FILES.md` inventories the package files.
 
 ### Known literal-tarball limitation
 
@@ -72,6 +72,28 @@ gitleaks dir "$PUBLIC_ROOT" --redact
 ```
 
 Do not set `HERDR_ENV=1` to bypass an unmanaged caller: first verify the actual caller as shown. Retain stdout/stderr, archive manifests/hashes, `smoke/results.json`, `office-opening/result.json` and cleanup diagnostics. Failed attempts and the unsupported tarball path remain evidence, not deleted to create a green summary.
+
+## AMA addition
+
+`@otixe/pi-cerebro-ama` 0.1.0 is validated separately as a replacement bridge/activator:
+
+- Surface contracts: 18/18 from source and the extracted 19-file archive (the original 11 intact plus seven leader/subagent tests).
+- Offline JSONL utility: 8/8 tests, retaining old-session classification, transition/cacheWrite separation, fork/duplicate exclusions, malformed usage, read-only input seals and exclusive output creation; adding profile partitions, independent profile cutoff and invalid-profile checks.
+- Fresh Pi 1.4.0 SDK, no provider: eight subagent or fourteen leader active direct core tools, profile-aware optional registry/codemode callability and real `cb_whoami` output `superficie_cb=ama` plus `perfil_cb`. Both source and extracted public packages are tested independently of any duplicate bridge.
+- The SDK uses an explicitly nonexistent identity and cached tool schemas: authentication is not exercised, every network attempt is prohibited, and a real nested codemode call fails closed rather than borrowing another identity. This is surface/guard validation, not production authentication or permission acceptance.
+- The original five shipping packages remain unchanged by AMA (80/80 checkout files byte-identical to the existing pre-AMA HEAD). The root smoke harness explicitly selects those five; it never co-loads AMA with a duplicate Cerebro bridge or herramientas activator. AMA has its own packaged tests and separate SDK acceptance.
+- The unchanged original-five candidate retains its accepted 20/20 contracts and independent/combined extracted-load evidence. R6 checks: 18/18 AMA contracts, 8/8 offline measurement tests from source and extracted archive; separate public-source/extracted SDK shadows for both profiles with zero provider/network requests. These shadows validate registered exposure under supplied role allowlists, not productive owner authentication or actual old-pane activation.
+- All six current archives are source-matched and repeat-pack byte-identical. The five original archives were refreshed to match current checkout manifest metadata (repository/author/homepage/bugs); their shipping sources were not edited. Prior artifacts and seals remain historical evidence, not substitutes for this candidate's hashes in `PACKAGES.md`.
+- Current directory and Git-history Gitleaks scans report zero findings without suppressions. Current inventory is 116 checkout files, 99 package files and 115 independently verified checksum entries.
+- The AMA addition is retained as a worktree candidate pending gate review, not a new commit, push or npm publication. Existing history contains the prior package delivery and its npm-metadata follow-up; current checkout hashes are independently listed in `SHA256SUMS`.
+
+Offline commands from the repository root:
+
+```sh
+(cd packages/pi-cerebro-ama && npm test)
+python3 packages/pi-cerebro-ama/tests/measure.test.py
+python3 packages/pi-cerebro-ama/bin/measure-jsonl.py YOUR_MANIFEST.json --output NEW_REPORT.json
+```
 
 ## Rollback and residues
 
